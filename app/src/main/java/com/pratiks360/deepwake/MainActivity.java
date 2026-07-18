@@ -1,4 +1,4 @@
-package com.brouken.runner;
+package com.pratiks360.deepwake;
 
 import android.app.Activity;
 import android.content.pm.ApplicationInfo;

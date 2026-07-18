@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.brouken.runner'
+    namespace 'com.pratiks360.deepwake'
     compileSdk 37
 
     defaultConfig {
-        applicationId "com.brouken.runner"
+        applicationId "com.pratiks360.deepwake"
         minSdk 26
         targetSdk 33
         versionCode 5

@@ -15,5 +15,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "Runner"
+rootProject.name = "DeepWake"
 include ':app'

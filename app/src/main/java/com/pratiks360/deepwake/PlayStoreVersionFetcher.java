@@ -1,4 +1,4 @@
-package com.brouken.runner;
+package com.pratiks360.deepwake;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
