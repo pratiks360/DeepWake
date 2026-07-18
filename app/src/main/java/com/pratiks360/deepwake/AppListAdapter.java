@@ -1,5 +1,6 @@
 package com.pratiks360.deepwake;
 
+import android.graphics.Color;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -37,7 +38,32 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         SleepingApp app = items.get(position);
         holder.name.setText(app.appName);
         holder.currentVersion.setText("Current: " + (app.currentVersion.isEmpty() ? "?" : app.currentVersion));
-        holder.latestVersion.setText("Latest: " + (app.latestVersion.isEmpty() ? "unknown" : app.latestVersion));
+
+        String latest = app.latestVersion == null ? "" : app.latestVersion;
+        String latestLabel;
+        boolean outdated = false;
+        boolean enableBtn = false;
+
+        if (latest.equals("checking...")) {
+            latestLabel = "Latest: checking...";
+        } else if (latest.isEmpty() || latest.equals(PlayStoreVersionFetcher.NO_MATCH)) {
+            latestLabel = "Latest: unknown (couldn't read Play Store)";
+        } else if (latest.equals(PlayStoreVersionFetcher.NET_ERROR)) {
+            latestLabel = "Latest: unavailable (network)";
+        } else {
+            latestLabel = "Latest: " + latest;
+            outdated = !latest.equals(app.currentVersion);
+            enableBtn = outdated;
+        }
+        holder.latestVersion.setText(latestLabel);
+
+        if (outdated) {
+            holder.latestVersion.setTextColor(Color.parseColor("#D32F2F"));
+        } else {
+            holder.latestVersion.setTextColor(Color.parseColor("#388E3C"));
+        }
+
+        holder.btnUpdate.setEnabled(enableBtn);
         holder.btnUpdate.setOnClickListener(v -> listener.onUpdateClick(app));
     }
 

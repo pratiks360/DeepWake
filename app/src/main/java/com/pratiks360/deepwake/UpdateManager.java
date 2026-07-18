@@ -11,23 +11,23 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Wakes sleeping apps in small batches (default 4) instead of all at once, so the
- * phone doesn't get slammed launching dozens of apps together. After a batch is woken,
- * it periodically re-checks each app's installed versionName against the latest known
- * version and only removes an app from the run once its installed version actually
- * matches - it does not assume "launched = updated".
+ * Wakes sleeping apps in small batches (default 4) instead of all at once, so the phone
+ * isn't slammed launching many apps together. After waking a batch it opens Play Store's
+ * "Manage apps & device" updates screen and then periodically re-checks each app: an app
+ * is only marked updated once its live installed version differs from the version recorded
+ * at scan time (currentVersion). This is robust to the app going back to sleep mid-update -
+ * only the version number moving matters, not the app's enabled/sleep state.
  *
- * Important: there is no API for a third-party app to silently force-install an update
- * for another app. This wakes the apps (so Play Store notices they're outdated) and
- * opens Play Store's "Manage apps & device / updates" screen so the user can tap
- * "Update all" there. This class detects when that update has actually landed.
+ * Note: a third-party app cannot silently force-install another app's update. This wakes
+ * the apps so Play Store sees them as active/outdated; the user taps "Update all" in Play
+ * Store, and this class detects when each update actually lands.
  */
 public class UpdateManager {
 
     private static final int BATCH_SIZE = 4;
-    private static final long STAGGER_MS = 1200;      // delay between launching apps within a batch
-    private static final long VERIFY_INTERVAL_MS = 5000; // how often to re-check installed versions
-    private static final int MAX_VERIFY_TRIES = 12;   // ~1 minute per batch before giving up and moving on
+    private static final long STAGGER_MS = 1200;
+    private static final long VERIFY_INTERVAL_MS = 5000;
+    private static final int MAX_VERIFY_TRIES = 12; // ~1 min per batch before moving on
 
     public interface Listener {
         void onAppUpdated(SleepingApp app);
@@ -47,14 +47,12 @@ public class UpdateManager {
         this.listener = listener;
     }
 
-    /** Wake + verify all given apps, BATCH_SIZE at a time. */
     public void updateAll(List<SleepingApp> apps) {
         batches = chunk(apps, BATCH_SIZE);
         batchIndex = 0;
         runNextBatch();
     }
 
-    /** Wake + verify a single app (same logic, batch of one). */
     public void updateSingle(SleepingApp app) {
         batches = new ArrayList<>();
         List<SleepingApp> single = new ArrayList<>();
@@ -96,8 +94,16 @@ public class UpdateManager {
         List<SleepingApp> stillPending = new ArrayList<>();
         for (SleepingApp app : pending) {
             String installed = getInstalledVersion(app.packageName);
-            boolean hasLatest = app.latestVersion != null && !app.latestVersion.isEmpty();
-            boolean updated = hasLatest && app.latestVersion.equals(installed);
+            boolean updated;
+            if (app.latestVersion != null && !app.latestVersion.isEmpty()
+                    && !app.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
+                    && !app.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) {
+                // we know the target version -> updated when installed reaches it
+                updated = app.latestVersion.equals(installed);
+            } else {
+                // no known target -> updated when installed simply changed from baseline
+                updated = installed != null && !installed.equals(app.currentVersion);
+            }
 
             if (updated) {
                 app.currentVersion = installed;
@@ -108,7 +114,6 @@ public class UpdateManager {
         }
 
         if (stillPending.isEmpty() || tryCount + 1 >= MAX_VERIFY_TRIES) {
-            // batch done (fully updated, or we gave up waiting - apps left in list for next scan/run)
             batchIndex++;
             runNextBatch();
         } else {

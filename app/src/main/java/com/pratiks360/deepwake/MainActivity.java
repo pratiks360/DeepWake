@@ -14,7 +14,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -54,17 +54,36 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
 
         btnScan.setOnClickListener(v -> scanForSleepingApps());
         btnUpdateAll.setOnClickListener(v -> {
-            if (appList.isEmpty()) {
-                Toast.makeText(this, "List is empty - scan first", Toast.LENGTH_SHORT).show();
+            List<SleepingApp> outdated = outdatedOnly();
+            if (outdated.isEmpty()) {
+                Toast.makeText(this, "No outdated apps to update", Toast.LENGTH_SHORT).show();
                 return;
             }
             btnUpdateAll.setEnabled(false);
-            updateManager.updateAll(new ArrayList<>(appList));
+            updateManager.updateAll(outdated);
         });
     }
 
+    /** Apps whose latest version is known AND differs from the installed version. */
+    private List<SleepingApp> outdatedOnly() {
+        List<SleepingApp> out = new ArrayList<>();
+        for (SleepingApp a : appList) {
+            if (isOutdated(a)) out.add(a);
+        }
+        return out;
+    }
+
+    private boolean isOutdated(SleepingApp a) {
+        if (a.latestVersion == null || a.latestVersion.isEmpty()) return false;
+        if (a.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
+                || a.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) return false;
+        return !a.latestVersion.equals(a.currentVersion);
+    }
+
     private void updateStatus() {
-        statusText.setText(appList.size() + " sleeping app(s) tracked");
+        int outdated = 0;
+        for (SleepingApp a : appList) if (isOutdated(a)) outdated++;
+        statusText.setText(outdated + " outdated / " + appList.size() + " sleeping tracked");
     }
 
     private void setScanning(boolean scanning) {
@@ -73,43 +92,72 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
     }
 
     /**
-     * Finds deep-sleeping, Play-Store-installed, non-system apps; reads their installed
-     * version; scrapes the Play Store listing for the latest version; merges the result
-     * into the persisted list (so previously found apps are kept/refreshed, not lost).
+     * Live scan: finds deep-sleeping, Play-Store-installed, non-system apps and adds each
+     * to the list AS IT IS FOUND (with latest = "checking..."), then fetches the Play Store
+     * latest version per app in the background and updates that row when it arrives.
      */
     private void scanForSleepingApps() {
         setScanning(true);
         executor.execute(() -> {
             PackageManager pm = getPackageManager();
-            Map<String, SleepingApp> merged = new HashMap<>();
-            for (SleepingApp a : AppListStorage.load(this)) {
-                merged.put(a.packageName, a);
-            }
+
+            // preserve any previously tracked entries
+            Map<String, SleepingApp> merged = new LinkedHashMap<>();
+            for (SleepingApp a : AppListStorage.load(this)) merged.put(a.packageName, a);
+
+            mainHandler.post(() -> {
+                appList.clear();
+                adapter.notifyDataSetChanged();
+                updateStatus();
+            });
 
             for (ApplicationInfo info : pm.getInstalledApplications(0)) {
                 if ((info.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
                 if (info.enabled) continue; // only deep-sleeping (disabled) apps
-                String installer = pm.getInstallerPackageName(info.packageName);
+                String installer;
+                try {
+                    installer = pm.getInstallerPackageName(info.packageName);
+                } catch (Exception e) {
+                    installer = null;
+                }
                 if (!"com.android.vending".equals(installer)) continue;
 
-                String currentVersion = getInstalledVersion(pm, info.packageName);
-                String latestVersion = PlayStoreVersionFetcher.fetchLatestVersion(info.packageName);
+                String current = getInstalledVersion(pm, info.packageName);
                 String appName = String.valueOf(pm.getApplicationLabel(info));
+                SleepingApp app = new SleepingApp(info.packageName, appName, current, "checking...");
+                merged.put(info.packageName, app);
 
-                merged.put(info.packageName, new SleepingApp(info.packageName, appName, currentVersion, latestVersion));
+                mainHandler.post(() -> {
+                    addOrUpdateRow(app);
+                    updateStatus();
+                });
+
+                // fetch latest version (still on this background executor)
+                String latest = PlayStoreVersionFetcher.fetchLatestVersion(info.packageName);
+                app.latestVersion = latest;
+
+                mainHandler.post(() -> {
+                    addOrUpdateRow(app);
+                    updateStatus();
+                });
             }
 
             List<SleepingApp> result = new ArrayList<>(merged.values());
             AppListStorage.save(this, result);
-
-            mainHandler.post(() -> {
-                appList.clear();
-                appList.addAll(result);
-                adapter.notifyDataSetChanged();
-                updateStatus();
-                setScanning(false);
-            });
+            mainHandler.post(() -> setScanning(false));
         });
+    }
+
+    private void addOrUpdateRow(SleepingApp app) {
+        for (int i = 0; i < appList.size(); i++) {
+            if (appList.get(i).packageName.equals(app.packageName)) {
+                appList.set(i, app);
+                adapter.notifyItemChanged(i);
+                return;
+            }
+        }
+        appList.add(app);
+        adapter.notifyItemInserted(appList.size() - 1);
     }
 
     private String getInstalledVersion(PackageManager pm, String packageName) {
