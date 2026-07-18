@@ -25,30 +25,57 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Compute version
+        id: ver
+        run: |
+          VERSION_NAME=$(./gradlew -q :app:printVersionName)
+          echo "tag=v${VERSION_NAME}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - name: Build debug APK
         run: ./gradlew assembleDebug
 
       - name: Build release APK (unsigned)
         run: ./gradlew assembleRelease
 
+      - name: Rename APKs with version
+        run: |
+          mkdir -p release-assets
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk \
+            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk"
+
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-unsigned
-          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk
 
-      - name: Compute release tag
+      - name: Delete previous releases and tags
         if: github.event_name == 'push'
-        id: ver
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION_NAME=$(./gradlew -q :app:printVersionName)
-          echo "tag=v${VERSION_NAME}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          api="https://api.github.com/repos/${{ github.repository }}"
+
+          # Releases are a GitHub object, not a git object, so removing them needs
+          # the REST API rather than a plain git command.
+          for id in $(curl -s -H "Authorization: token $GITHUB_TOKEN" "$api/releases" | jq -r '.[].id'); do
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" "$api/releases/$id"
+          done
+
+          # The underlying tags ARE git objects - delete those with plain git.
+          git fetch --tags
+          for tag in $(git tag -l 'v*'); do
+            git push origin ":refs/tags/$tag" || true
+            git tag -d "$tag" || true
+          done
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
@@ -57,8 +84,8 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
           files: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/release/app-release-unsigned.apk
+            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk
+            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
