@@ -47,7 +47,7 @@ jobs:
         if: github.event_name == 'push'
         id: ver
         run: |
-          VERSION_NAME=$(grep -oP 'versionName\s+"\K[^"]+' app/build.gradle)
+          VERSION_NAME=$(./gradlew -q :app:printVersionName)
           echo "tag=v${VERSION_NAME}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
