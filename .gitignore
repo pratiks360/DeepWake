@@ -1,3 +1,5 @@
+##Standard Android Studio ignores
+
 *.iml
 .gradle
 /local.properties
