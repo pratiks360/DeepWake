@@ -140,7 +140,7 @@ public class PlayStoreVersionFetcher {
     }
 
     // Filters out things that are version-shaped but clearly not app versions
-    // (screen densities, SDK numbers, timestamps split oddly, etc.)
+    // (screen densities, SDK numbers, timestamps split oddly, star ratings, etc.)
     private static boolean isRealVersion(String v) {
         if (v == null) return false;
         if (v.equalsIgnoreCase("Varies with device")) return false;
@@ -149,6 +149,18 @@ public class PlayStoreVersionFetcher {
         // reject absurdly long single groups (likely ids/timestamps)
         for (String p : parts) {
             if (p.length() > 4) return false;
+        }
+        // Play Store embeds its star rating as a bare "X.Y" token (e.g. "4.6", always
+        // 0.0-5.0 with exactly one decimal digit) in several places on the page - that
+        // shape is indistinguishable from a short version number except by range, and
+        // it appears often enough to win the frequency-based fallback below, which was
+        // showing the rating as the "latest version". Reject it.
+        if (parts.length == 2 && parts[1].length() == 1) {
+            try {
+                double d = Double.parseDouble(v);
+                if (d >= 0.0 && d <= 5.0) return false;
+            } catch (NumberFormatException ignored) {
+            }
         }
         return true;
     }
