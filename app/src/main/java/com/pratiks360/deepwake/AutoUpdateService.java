@@ -15,6 +15,7 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -354,6 +355,15 @@ public class AutoUpdateService extends AccessibilityService {
             // blocks the user's input to whatever is underneath while the flow runs.
             box.setClickable(true);
 
+            // Indeterminate spinner - a live "working" animation for the whole run.
+            ProgressBar spinner = new ProgressBar(this);
+            spinner.setIndeterminate(true);
+            LinearLayout.LayoutParams spinnerLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            spinnerLp.bottomMargin = pad;
+            spinner.setLayoutParams(spinnerLp);
+            box.addView(spinner);
+
             overlayStatus = new TextView(this);
             overlayStatus.setTextColor(Color.WHITE);
             overlayStatus.setTextSize(18);
@@ -382,6 +392,12 @@ public class AutoUpdateService extends AccessibilityService {
                     PixelFormat.TRANSLUCENT);
             windowManager.addView(box, lp);
             overlay = box;
+
+            // Fade + slight scale-up so the shade eases in rather than snapping on.
+            box.setAlpha(0f);
+            box.setScaleX(1.04f);
+            box.setScaleY(1.04f);
+            box.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).start();
         } catch (Exception e) {
             // Overlay is cosmetic protection - never let it break the update flow itself.
             Log.w(TAG, "overlay failed: " + e.getMessage());

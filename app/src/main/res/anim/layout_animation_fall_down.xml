@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Staggers item_fall_down across the list so rows cascade in on (re)load. -->
+<layoutAnimation xmlns:android="http://schemas.android.com/apk/res/android"
+    android:animation="@anim/item_fall_down"
+    android:animationOrder="normal"
+    android:delay="8%" />
