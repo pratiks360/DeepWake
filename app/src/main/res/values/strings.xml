@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">DeepWake</string>
+    <string name="accessibility_service_description">Used only during batch updates: DeepWake watches the Play Store screen to tap its Update buttons for you, and shows a full-screen shade that blocks accidental touches while your sleeping apps are woken and updated. It only reads the Play Store app\'s screen, never any other app.</string>
 </resources>

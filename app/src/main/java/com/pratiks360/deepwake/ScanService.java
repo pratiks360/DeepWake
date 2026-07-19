@@ -151,11 +151,6 @@ public class ScanService extends Service implements UpdateManager.Listener {
         });
     }
 
-    public void startUpdateAll(List<SleepingApp> apps) {
-        updateNotification("Waking " + apps.size() + " app(s)...");
-        updateManager.updateAll(apps);
-    }
-
     public void startUpdateSingle(SleepingApp app) {
         updateNotification("Waking " + app.appName + "...");
         updateManager.updateSingle(app);
