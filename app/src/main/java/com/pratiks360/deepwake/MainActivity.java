@@ -10,7 +10,9 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.provider.Settings;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -32,6 +34,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
     private final Set<String> trackedPackages = new HashSet<>();
     private AppListAdapter adapter;
     private Button btnScan, btnUpdateAll;
+    private CheckBox cbSelectAll;
     private TextView statusText;
 
     private ScanService scanService;
@@ -59,6 +62,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
 
         btnScan = findViewById(R.id.btnScan);
         btnUpdateAll = findViewById(R.id.btnUpdateAll);
+        cbSelectAll = findViewById(R.id.cbSelectAll);
         statusText = findViewById(R.id.statusText);
 
         RecyclerView recyclerView = findViewById(R.id.recyclerView);
@@ -82,15 +86,31 @@ public class MainActivity extends Activity implements ScanService.Listener {
             ContextCompat.startForegroundService(this, new Intent(this, ScanService.class));
             if (scanService != null) scanService.startScan();
         });
+        cbSelectAll.setOnCheckedChangeListener((btn, checked) -> {
+            for (SleepingApp a : appList) a.selected = checked;
+            adapter.notifyDataSetChanged();
+        });
         btnUpdateAll.setOnClickListener(v -> {
-            List<SleepingApp> outdated = outdatedOnly();
-            if (outdated.isEmpty()) {
-                Toast.makeText(this, "No outdated apps to update", Toast.LENGTH_SHORT).show();
+            List<SleepingApp> selected = selectedOutdated();
+            if (selected.isEmpty()) {
+                Toast.makeText(this, "No apps selected for update", Toast.LENGTH_SHORT).show();
                 return;
             }
-            btnUpdateAll.setEnabled(false);
-            ContextCompat.startForegroundService(this, new Intent(this, ScanService.class));
-            if (scanService != null) scanService.startUpdateAll(outdated);
+            AutoUpdateService svc = AutoUpdateService.getInstance();
+            if (svc == null) {
+                // Batch mode is fully automated (auto-clicking Play Store's buttons, the
+                // touch-blocking shade) and that requires the accessibility service.
+                Toast.makeText(this,
+                        "Enable \"DeepWake\" in Accessibility settings to allow automatic batch updates",
+                        Toast.LENGTH_LONG).show();
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                return;
+            }
+            if (svc.isRunning()) {
+                Toast.makeText(this, "A batch update is already running", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            svc.startBatchUpdate(selected);
         });
     }
 
@@ -116,19 +136,23 @@ public class MainActivity extends Activity implements ScanService.Listener {
         List<SleepingApp> all = AppListStorage.load(this);
         trackedPackages.clear();
         appList.clear();
+        boolean selectAll = cbSelectAll == null || cbSelectAll.isChecked();
         for (SleepingApp a : all) {
             trackedPackages.add(a.packageName);
-            if (isOutdated(a)) appList.add(a);
+            if (isOutdated(a)) {
+                a.selected = selectAll;
+                appList.add(a);
+            }
         }
         adapter.notifyDataSetChanged();
         updateStatus();
     }
 
-    /** Apps whose latest version is known AND is a real, strictly newer version. */
-    private List<SleepingApp> outdatedOnly() {
+    /** Checked apps whose latest version is known AND is a real, strictly newer version. */
+    private List<SleepingApp> selectedOutdated() {
         List<SleepingApp> out = new ArrayList<>();
         for (SleepingApp a : appList) {
-            if (isOutdated(a)) out.add(a);
+            if (a.selected && isOutdated(a)) out.add(a);
         }
         return out;
     }

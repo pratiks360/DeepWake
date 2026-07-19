@@ -5,6 +5,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -65,6 +66,12 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
 
         holder.btnUpdate.setEnabled(enableBtn);
         holder.btnUpdate.setOnClickListener(v -> listener.onUpdateClick(app));
+
+        // Recycled rows keep their old listener - detach it before setChecked, or binding
+        // a row would clobber the selection state of whichever app previously used it.
+        holder.cbSelect.setOnCheckedChangeListener(null);
+        holder.cbSelect.setChecked(app.selected);
+        holder.cbSelect.setOnCheckedChangeListener((btn, checked) -> app.selected = checked);
     }
 
     @Override
@@ -75,6 +82,7 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
     static class ViewHolder extends RecyclerView.ViewHolder {
         TextView name, currentVersion, latestVersion;
         Button btnUpdate;
+        CheckBox cbSelect;
 
         ViewHolder(View itemView) {
             super(itemView);
@@ -82,6 +90,7 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
             currentVersion = itemView.findViewById(R.id.currentVersion);
             latestVersion = itemView.findViewById(R.id.latestVersion);
             btnUpdate = itemView.findViewById(R.id.btnUpdateSingle);
+            cbSelect = itemView.findViewById(R.id.cbSelect);
         }
     }
 }

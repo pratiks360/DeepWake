@@ -11,30 +11,27 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Wakes sleeping apps in small batches (default 4), then opens Play Store's "Manage apps &
- * device" updates screen. Every activity start here (each woken app, then Play Store) is
- * fired synchronously, back-to-back, in the same call stack as the user's tap on Update /
- * Update All - Android's background-activity-start restrictions can silently drop an
- * activity start that isn't a direct, immediate continuation of a foreground app's own
- * action, and merely running a foreground service isn't enough on its own to be exempt.
- * A `Handler.postDelayed` in between (as this used to do, to stagger the launches and let
- * each app "flash" on screen before reclaiming Play Store) falls outside that window once
- * this app itself is no longer visible, which left the most recently launched app stuck on
- * screen with the Play Store switch silently never happening.
+ * Handles SINGLE-app updates: wake the sleeping app, then immediately hand the foreground
+ * to Play Store's updates screen. Both activity starts fire synchronously, back-to-back,
+ * in the same call stack as the user's tap on Update - Android's background-activity-start
+ * restrictions can silently drop an activity start that isn't a direct, immediate
+ * continuation of a foreground app's own action (a foreground service alone isn't exempt),
+ * which is why no Handler delay is allowed anywhere in the wake path.
  *
- * Once every batch has been woken, a single verification pass periodically re-checks all of
- * them together (this doesn't start any activities, so it's free to use delayed polling): an
- * app is only marked updated once its live installed version differs from the version
- * recorded at scan time (currentVersion). This is robust to the app going back to sleep
- * mid-update - only the version number moving matters, not the app's enabled/sleep state.
+ * Batch updates live in AutoUpdateService instead - being a system-bound accessibility
+ * service exempts it from those restrictions, which multi-batch orchestration needs.
+ *
+ * Verification then polls until the installed version actually moves: an app is only
+ * marked updated once its live installed version differs from the version recorded at
+ * scan time (currentVersion). This is robust to the app going back to sleep mid-update -
+ * only the version number moving matters, not the app's enabled/sleep state.
  *
  * Note: a third-party app cannot silently force-install another app's update. This wakes
- * the apps so Play Store sees them as active/outdated; the user taps "Update all" in Play
- * Store, and this class detects when each update actually lands.
+ * the app so Play Store sees it as active/outdated; the user taps Update in Play Store,
+ * and this class detects when the update actually lands.
  */
 public class UpdateManager {
 
-    private static final int BATCH_SIZE = 4;
     private static final long VERIFY_INTERVAL_MS = 5000;
     private static final int MAX_VERIFY_TRIES = 24; // ~2 min verification window
 
@@ -53,48 +50,13 @@ public class UpdateManager {
         this.listener = listener;
     }
 
-    public void updateAll(List<SleepingApp> apps) {
-        wakeAllBatches(chunk(apps, BATCH_SIZE));
-    }
-
     public void updateSingle(SleepingApp app) {
         List<SleepingApp> single = new ArrayList<>();
         single.add(app);
-        List<List<SleepingApp>> batches = new ArrayList<>();
-        batches.add(single);
-        wakeAllBatches(batches);
-    }
-
-    private List<List<SleepingApp>> chunk(List<SleepingApp> apps, int size) {
-        List<List<SleepingApp>> out = new ArrayList<>();
-        for (int i = 0; i < apps.size(); i += size) {
-            out.add(new ArrayList<>(apps.subList(i, Math.min(i + size, apps.size()))));
-        }
-        return out;
-    }
-
-    private void wakeAllBatches(List<List<SleepingApp>> batches) {
-        List<SleepingApp> all = new ArrayList<>();
-        for (List<SleepingApp> batch : batches) {
-            listener.onBatchStarted(batch);
-            for (SleepingApp app : batch) {
-                launchApp(app.packageName);
-                all.add(app);
-            }
-            // Reclaim the foreground for Play Store right after this batch's launches,
-            // still in the same synchronous call chain - see class doc for why this must
-            // not go through a delayed callback.
-            openPlayStoreUpdates();
-        }
-        beginVerification(all);
-    }
-
-    private void beginVerification(List<SleepingApp> all) {
-        if (all.isEmpty()) {
-            listener.onAllDone();
-            return;
-        }
-        handler.postDelayed(() -> verifyPending(all, 0), VERIFY_INTERVAL_MS);
+        listener.onBatchStarted(single);
+        launchApp(app.packageName);
+        openPlayStoreUpdates();
+        handler.postDelayed(() -> verifyPending(single, 0), VERIFY_INTERVAL_MS);
     }
 
     private void verifyPending(List<SleepingApp> pending, int tryCount) {
