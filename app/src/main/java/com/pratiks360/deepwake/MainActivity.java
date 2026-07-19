@@ -1,43 +1,56 @@
 package com.pratiks360.deepwake;
 
+import android.Manifest;
 import android.app.Activity;
-import android.content.pm.ApplicationInfo;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.IBinder;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
-public class MainActivity extends Activity implements UpdateManager.Listener {
+public class MainActivity extends Activity implements ScanService.Listener {
 
     private final List<SleepingApp> appList = new ArrayList<>();
     private AppListAdapter adapter;
-    private ExecutorService executor;
-    private Handler mainHandler;
-    private UpdateManager updateManager;
     private Button btnScan, btnUpdateAll;
     private TextView statusText;
+
+    private ScanService scanService;
+    private boolean bound;
+    private final ServiceConnection connection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            scanService = ((ScanService.LocalBinder) service).getService();
+            scanService.setListener(MainActivity.this);
+            bound = true;
+            setScanning(scanService.isScanning());
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            scanService = null;
+            bound = false;
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-
-        executor = Executors.newSingleThreadExecutor();
-        mainHandler = new Handler(Looper.getMainLooper());
-        updateManager = new UpdateManager(this, this);
 
         btnScan = findViewById(R.id.btnScan);
         btnUpdateAll = findViewById(R.id.btnUpdateAll);
@@ -45,14 +58,25 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
 
         RecyclerView recyclerView = findViewById(R.id.recyclerView);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
-        adapter = new AppListAdapter(appList, app -> updateManager.updateSingle(app));
+        adapter = new AppListAdapter(appList, app -> {
+            if (scanService != null) scanService.startUpdateSingle(app);
+        });
         recyclerView.setAdapter(adapter);
 
-        appList.addAll(AppListStorage.load(this));
-        adapter.notifyDataSetChanged();
-        updateStatus();
+        reloadFromStorage();
 
-        btnScan.setOnClickListener(v -> scanForSleepingApps());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+        }
+
+        btnScan.setOnClickListener(v -> {
+            setScanning(true);
+            ContextCompat.startForegroundService(this, new Intent(this, ScanService.class));
+            if (scanService != null) scanService.startScan();
+        });
         btnUpdateAll.setOnClickListener(v -> {
             List<SleepingApp> outdated = outdatedOnly();
             if (outdated.isEmpty()) {
@@ -60,8 +84,34 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
                 return;
             }
             btnUpdateAll.setEnabled(false);
-            updateManager.updateAll(outdated);
+            ContextCompat.startForegroundService(this, new Intent(this, ScanService.class));
+            if (scanService != null) scanService.startUpdateAll(outdated);
         });
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        bindService(new Intent(this, ScanService.class), connection, Context.BIND_AUTO_CREATE);
+        // The service may have kept scanning/saving while this Activity was unbound.
+        reloadFromStorage();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (bound) {
+            scanService.setListener(null);
+            unbindService(connection);
+            bound = false;
+        }
+    }
+
+    private void reloadFromStorage() {
+        appList.clear();
+        appList.addAll(AppListStorage.load(this));
+        adapter.notifyDataSetChanged();
+        updateStatus();
     }
 
     /** Apps whose latest version is known AND differs from the installed version. */
@@ -91,63 +141,6 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
         btnScan.setText(scanning ? "Scanning..." : "Scan for updates");
     }
 
-    /**
-     * Live scan: finds deep-sleeping, Play-Store-installed, non-system apps and adds each
-     * to the list AS IT IS FOUND (with latest = "checking..."), then fetches the Play Store
-     * latest version per app in the background and updates that row when it arrives.
-     */
-    private void scanForSleepingApps() {
-        setScanning(true);
-        executor.execute(() -> {
-            PackageManager pm = getPackageManager();
-
-            // preserve any previously tracked entries
-            Map<String, SleepingApp> merged = new LinkedHashMap<>();
-            for (SleepingApp a : AppListStorage.load(this)) merged.put(a.packageName, a);
-
-            mainHandler.post(() -> {
-                appList.clear();
-                adapter.notifyDataSetChanged();
-                updateStatus();
-            });
-
-            for (ApplicationInfo info : pm.getInstalledApplications(0)) {
-                if ((info.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
-                if (info.enabled) continue; // only deep-sleeping (disabled) apps
-                String installer;
-                try {
-                    installer = pm.getInstallerPackageName(info.packageName);
-                } catch (Exception e) {
-                    installer = null;
-                }
-                if (!"com.android.vending".equals(installer)) continue;
-
-                String current = getInstalledVersion(pm, info.packageName);
-                String appName = String.valueOf(pm.getApplicationLabel(info));
-                SleepingApp app = new SleepingApp(info.packageName, appName, current, "checking...");
-                merged.put(info.packageName, app);
-
-                mainHandler.post(() -> {
-                    addOrUpdateRow(app);
-                    updateStatus();
-                });
-
-                // fetch latest version (still on this background executor)
-                String latest = PlayStoreVersionFetcher.fetchLatestVersion(info.packageName);
-                app.latestVersion = latest;
-
-                mainHandler.post(() -> {
-                    addOrUpdateRow(app);
-                    updateStatus();
-                });
-            }
-
-            List<SleepingApp> result = new ArrayList<>(merged.values());
-            AppListStorage.save(this, result);
-            mainHandler.post(() -> setScanning(false));
-        });
-    }
-
     private void addOrUpdateRow(SleepingApp app) {
         for (int i = 0; i < appList.size(); i++) {
             if (appList.get(i).packageName.equals(app.packageName)) {
@@ -160,18 +153,26 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
         adapter.notifyItemInserted(appList.size() - 1);
     }
 
-    private String getInstalledVersion(PackageManager pm, String packageName) {
-        try {
-            return pm.getPackageInfo(packageName, 0).versionName;
-        } catch (PackageManager.NameNotFoundException e) {
-            return "";
-        }
+    @Override
+    public void onScanStarted() {
+        setScanning(true);
+    }
+
+    @Override
+    public void onRowUpdated(SleepingApp app) {
+        addOrUpdateRow(app);
+        updateStatus();
+    }
+
+    @Override
+    public void onScanFinished() {
+        setScanning(false);
+        reloadFromStorage();
     }
 
     @Override
     public void onAppUpdated(SleepingApp app) {
         appList.removeIf(a -> a.packageName.equals(app.packageName));
-        AppListStorage.save(this, appList);
         adapter.notifyDataSetChanged();
         updateStatus();
         Toast.makeText(this, app.appName + " updated", Toast.LENGTH_SHORT).show();
@@ -183,7 +184,7 @@ public class MainActivity extends Activity implements UpdateManager.Listener {
     }
 
     @Override
-    public void onAllDone() {
+    public void onUpdateAllFinished() {
         btnUpdateAll.setEnabled(true);
         Toast.makeText(this, "Update run finished", Toast.LENGTH_SHORT).show();
     }
