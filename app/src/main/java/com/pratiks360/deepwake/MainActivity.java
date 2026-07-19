@@ -33,6 +33,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
     private final List<SleepingApp> appList = new ArrayList<>();
     private final Set<String> trackedPackages = new HashSet<>();
     private AppListAdapter adapter;
+    private RecyclerView recyclerView;
     private Button btnScan, btnUpdateAll;
     private CheckBox cbSelectAll;
     private TextView statusText;
@@ -65,7 +66,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
         cbSelectAll = findViewById(R.id.cbSelectAll);
         statusText = findViewById(R.id.statusText);
 
-        RecyclerView recyclerView = findViewById(R.id.recyclerView);
+        recyclerView = findViewById(R.id.recyclerView);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         adapter = new AppListAdapter(appList, app -> {
             if (scanService != null) scanService.startUpdateSingle(app);
@@ -145,6 +146,9 @@ public class MainActivity extends Activity implements ScanService.Listener {
             }
         }
         adapter.notifyDataSetChanged();
+        // Re-run the staggered cascade so a fresh scan's results animate in, not just the
+        // very first layout (layoutAnimation otherwise only fires once, on initial attach).
+        if (recyclerView != null) recyclerView.scheduleLayoutAnimation();
         updateStatus();
     }
 

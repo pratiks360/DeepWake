@@ -96,7 +96,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
         Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("DeepWake")
                 .setContentText(text)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_deepwake)
                 .setOngoing(true)
                 .build();
         startForeground(NOTIFICATION_ID, n);

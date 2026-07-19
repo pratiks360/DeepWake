@@ -15,6 +15,7 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -50,7 +51,9 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long VERIFY_INTERVAL_MS = 5000;
     private static final int MAX_VERIFY_TRIES = 24;   // ~2 min per batch
     private static final int MAX_FINAL_TRIES = 24;    // ~2 min extra for stragglers at the end
-    private static final long CLICK_COOLDOWN_MS = 4000;
+    private static final long CLICK_COOLDOWN_MS = 3000;
+    private static final long POLL_INTERVAL_MS = 1200; // retry the click even without events
+    private static final String PLAY_STORE_PKG = "com.android.vending";
 
     // Accessibility services are singletons managed by the system; this is the standard
     // way for the rest of the app to reach the live instance (null = not enabled).
@@ -73,6 +76,19 @@ public class AutoUpdateService extends AccessibilityService {
     private boolean running;
     private boolean autoClickArmed;
     private long lastClickAttempt;
+
+    // While armed, keep retrying the click on a timer - Play Store's "Update all" button
+    // appears only after the page finishes loading over the network, and relying solely on
+    // accessibility events to catch that moment is unreliable (events can be missed or
+    // throttled). The poll re-posts itself; CLICK_COOLDOWN_MS still rate-limits real taps.
+    private final Runnable autoClickPoll = new Runnable() {
+        @Override
+        public void run() {
+            if (!running || !autoClickArmed) return;
+            attemptAutoClick();
+            handler.postDelayed(this, POLL_INTERVAL_MS);
+        }
+    };
 
     @Override
     protected void onServiceConnected() {
@@ -130,6 +146,8 @@ public class AutoUpdateService extends AccessibilityService {
             finalVerification();
             return;
         }
+        // Don't click while we're busy launching apps - only once we're on Play Store.
+        disarmAutoClick();
         List<SleepingApp> batch = batches.get(batchIndex);
         setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
                 + ": waking " + batch.size() + " app(s)...");
@@ -142,16 +160,27 @@ public class AutoUpdateService extends AccessibilityService {
             // The WHOLE batch is open now - only at this point switch to Play Store.
             handler.postDelayed(() -> {
                 if (!running) return;
-                autoClickArmed = true;
                 openPlayStoreUpdates();
                 setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
                         + ": waiting for Play Store to update " + batch.size() + " app(s)...");
+                armAutoClick();
                 handler.postDelayed(() -> verifyBatch(new ArrayList<>(batch), 0), VERIFY_INTERVAL_MS);
             }, SETTLE_MS);
             return;
         }
         launchApp(batch.get(i).packageName);
         handler.postDelayed(() -> wakeOne(batch, i + 1), STAGGER_MS);
+    }
+
+    private void armAutoClick() {
+        autoClickArmed = true;
+        handler.removeCallbacks(autoClickPoll);
+        handler.postDelayed(autoClickPoll, POLL_INTERVAL_MS);
+    }
+
+    private void disarmAutoClick() {
+        autoClickArmed = false;
+        handler.removeCallbacks(autoClickPoll);
     }
 
     private void verifyBatch(List<SleepingApp> pending, int tryCount) {
@@ -181,6 +210,9 @@ public class AutoUpdateService extends AccessibilityService {
             finishFlow();
             return;
         }
+        // Play Store is still in front from the last batch; keep clicking any Update button
+        // that's still showing while the stragglers finish.
+        armAutoClick();
         setOverlayStatus("Waiting for " + leftovers.size() + " remaining update(s)...");
         verifyLeftovers(new ArrayList<>(leftovers), 0);
     }
@@ -304,16 +336,42 @@ public class AutoUpdateService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // Config filters events to com.android.vending only; still gate on our own state.
+        // Events are one trigger; the poll (armAutoClick) is the other. Both funnel here.
+        attemptAutoClick();
+    }
+
+    private void attemptAutoClick() {
         if (!running || !autoClickArmed) return;
         long now = System.currentTimeMillis();
         if (now - lastClickAttempt < CLICK_COOLDOWN_MS) return;
 
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-        if (clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update")) {
-            lastClickAttempt = now;
+        // Our own full-screen tint is an accessibility overlay window that can be reported
+        // as the "active" window, so getRootInActiveWindow() may hand back DeepWake's
+        // overlay (which has no Update button) instead of Play Store. Walk every window and
+        // act only on the one that actually belongs to Play Store.
+        boolean clicked = false;
+        List<android.view.accessibility.AccessibilityWindowInfo> windows = getWindows();
+        if (windows != null) {
+            for (android.view.accessibility.AccessibilityWindowInfo w : windows) {
+                AccessibilityNodeInfo root = w.getRoot();
+                if (root == null) continue;
+                CharSequence pkg = root.getPackageName();
+                if (pkg == null || !PLAY_STORE_PKG.contentEquals(pkg)) continue;
+                if (clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update")) {
+                    clicked = true;
+                    break;
+                }
+            }
         }
+        if (!clicked) {
+            // Fallback for devices/versions where getWindows() returns nothing usable.
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null && root.getPackageName() != null
+                    && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
+                clicked = clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update");
+            }
+        }
+        if (clicked) lastClickAttempt = now;
     }
 
     private boolean clickButtonLabeled(AccessibilityNodeInfo root, String label) {
@@ -354,6 +412,15 @@ public class AutoUpdateService extends AccessibilityService {
             // blocks the user's input to whatever is underneath while the flow runs.
             box.setClickable(true);
 
+            // Indeterminate spinner - a live "working" animation for the whole run.
+            ProgressBar spinner = new ProgressBar(this);
+            spinner.setIndeterminate(true);
+            LinearLayout.LayoutParams spinnerLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            spinnerLp.bottomMargin = pad;
+            spinner.setLayoutParams(spinnerLp);
+            box.addView(spinner);
+
             overlayStatus = new TextView(this);
             overlayStatus.setTextColor(Color.WHITE);
             overlayStatus.setTextSize(18);
@@ -382,6 +449,12 @@ public class AutoUpdateService extends AccessibilityService {
                     PixelFormat.TRANSLUCENT);
             windowManager.addView(box, lp);
             overlay = box;
+
+            // Fade + slight scale-up so the shade eases in rather than snapping on.
+            box.setAlpha(0f);
+            box.setScaleX(1.04f);
+            box.setScaleY(1.04f);
+            box.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).start();
         } catch (Exception e) {
             // Overlay is cosmetic protection - never let it break the update flow itself.
             Log.w(TAG, "overlay failed: " + e.getMessage());
