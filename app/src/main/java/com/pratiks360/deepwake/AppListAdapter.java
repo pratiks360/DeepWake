@@ -52,7 +52,7 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
             latestLabel = "Latest: unavailable (network)";
         } else {
             latestLabel = "Latest: " + latest;
-            outdated = !latest.equals(app.currentVersion);
+            outdated = PlayStoreVersionFetcher.isNewerVersion(latest, app.currentVersion);
             enableBtn = outdated;
         }
         holder.latestVersion.setText(latestLabel);

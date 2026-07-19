@@ -20,11 +20,16 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 public class MainActivity extends Activity implements ScanService.Listener {
 
+    // Only outdated (or still-being-checked) apps are shown - sleeping apps that are
+    // already current aren't actionable, so there's no point cluttering the list with them.
     private final List<SleepingApp> appList = new ArrayList<>();
+    private final Set<String> trackedPackages = new HashSet<>();
     private AppListAdapter adapter;
     private Button btnScan, btnUpdateAll;
     private TextView statusText;
@@ -108,13 +113,18 @@ public class MainActivity extends Activity implements ScanService.Listener {
     }
 
     private void reloadFromStorage() {
+        List<SleepingApp> all = AppListStorage.load(this);
+        trackedPackages.clear();
         appList.clear();
-        appList.addAll(AppListStorage.load(this));
+        for (SleepingApp a : all) {
+            trackedPackages.add(a.packageName);
+            if (isOutdated(a)) appList.add(a);
+        }
         adapter.notifyDataSetChanged();
         updateStatus();
     }
 
-    /** Apps whose latest version is known AND differs from the installed version. */
+    /** Apps whose latest version is known AND is a real, strictly newer version. */
     private List<SleepingApp> outdatedOnly() {
         List<SleepingApp> out = new ArrayList<>();
         for (SleepingApp a : appList) {
@@ -127,13 +137,13 @@ public class MainActivity extends Activity implements ScanService.Listener {
         if (a.latestVersion == null || a.latestVersion.isEmpty()) return false;
         if (a.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
                 || a.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) return false;
-        return !a.latestVersion.equals(a.currentVersion);
+        return PlayStoreVersionFetcher.isNewerVersion(a.latestVersion, a.currentVersion);
     }
 
     private void updateStatus() {
         int outdated = 0;
         for (SleepingApp a : appList) if (isOutdated(a)) outdated++;
-        statusText.setText(outdated + " outdated / " + appList.size() + " sleeping tracked");
+        statusText.setText(outdated + " outdated / " + trackedPackages.size() + " sleeping tracked");
     }
 
     private void setScanning(boolean scanning) {
@@ -153,6 +163,16 @@ public class MainActivity extends Activity implements ScanService.Listener {
         adapter.notifyItemInserted(appList.size() - 1);
     }
 
+    private void removeRow(String packageName) {
+        for (int i = 0; i < appList.size(); i++) {
+            if (appList.get(i).packageName.equals(packageName)) {
+                appList.remove(i);
+                adapter.notifyItemRemoved(i);
+                return;
+            }
+        }
+    }
+
     @Override
     public void onScanStarted() {
         setScanning(true);
@@ -160,7 +180,13 @@ public class MainActivity extends Activity implements ScanService.Listener {
 
     @Override
     public void onRowUpdated(SleepingApp app) {
-        addOrUpdateRow(app);
+        trackedPackages.add(app.packageName);
+        boolean checking = "checking...".equals(app.latestVersion);
+        if (checking || isOutdated(app)) {
+            addOrUpdateRow(app);
+        } else {
+            removeRow(app.packageName);
+        }
         updateStatus();
     }
 
@@ -172,6 +198,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
 
     @Override
     public void onAppUpdated(SleepingApp app) {
+        trackedPackages.remove(app.packageName);
         appList.removeIf(a -> a.packageName.equals(app.packageName));
         adapter.notifyDataSetChanged();
         updateStatus();

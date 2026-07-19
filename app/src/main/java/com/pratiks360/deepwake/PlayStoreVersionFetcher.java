@@ -42,7 +42,11 @@ public class PlayStoreVersionFetcher {
             "Varies with device", "Version", "Current Version", "Updated on", "What's New", "New features"
     };
 
-    public static String fetchLatestVersion(String packageName) {
+    /**
+     * @param currentVersion the installed version, used to disambiguate noisy candidates -
+     *                       pass "" if unknown.
+     */
+    public static String fetchLatestVersion(String packageName, String currentVersion) {
         String urlStr = "https://play.google.com/store/apps/details?id="
                 + packageName + "&hl=en&gl=US";
         HttpURLConnection conn = null;
@@ -85,8 +89,14 @@ public class PlayStoreVersionFetcher {
             // 3) Fallback: Play Store no longer exposes a labeled version field on the
             //    public listing page. The only version-shaped tokens left on the page are
             //    the per-review "app version" tags Play Store attaches to each review in
-            //    the reviews carousel (the version the reviewer had installed at the time).
-            best = maxVersionToken(page);
+            //    the reviews carousel (the version the reviewer had installed at the time),
+            //    mixed in with unrelated small numeric tags from the same nested review
+            //    data (rating breakdowns, helpfulness-vote weights, etc). Those unrelated
+            //    tags are usually short (2 segments) and can outrank a real, longer version
+            //    string on pure magnitude, so prefer candidates whose segment count matches
+            //    the installed version's - a real update essentially never changes how many
+            //    dot-separated parts a version string has.
+            best = maxVersionToken(page, currentVersion);
             if (best != null) return best;
 
             // Nothing usable - log a hint around the first anchor so we can refine.
@@ -123,18 +133,32 @@ public class PlayStoreVersionFetcher {
 
     // Reviewers skew toward whatever version they installed a while ago, so older
     // releases accumulate far more tagged reviews than the newest one - picking the
-    // most-frequent token (the previous strategy) systematically returns a stale
-    // version and can look like a "major mismatch" against the real current version.
-    // The highest version actually seen is a much better lower-bound estimate.
-    private static String maxVersionToken(String page) {
+    // most-frequent token (the old strategy) systematically returns a stale version.
+    // The highest version actually seen, restricted to tokens shaped like the installed
+    // version, is a much better lower-bound estimate.
+    private static String maxVersionToken(String page, String currentVersion) {
+        int wantSegments = (currentVersion != null && !currentVersion.isEmpty())
+                ? currentVersion.split("\\.").length : -1;
+
         Matcher m = VERSION_TOKEN.matcher(page);
-        String best = null;
+        String bestMatching = null;
+        String bestAny = null;
         while (m.find()) {
             String v = m.group(1);
             if (!isRealVersion(v)) continue;
-            if (best == null || compareVersions(v, best) > 0) best = v;
+            if (bestAny == null || compareVersions(v, bestAny) > 0) bestAny = v;
+            if (wantSegments > 0 && v.split("\\.").length == wantSegments
+                    && (bestMatching == null || compareVersions(v, bestMatching) > 0)) {
+                bestMatching = v;
+            }
         }
-        return best;
+        return bestMatching != null ? bestMatching : bestAny;
+    }
+
+    /** True if latest is a strictly newer version than current (numeric, not lexicographic). */
+    public static boolean isNewerVersion(String latest, String current) {
+        if (latest == null || current == null || latest.isEmpty() || current.isEmpty()) return false;
+        return compareVersions(latest, current) > 0;
     }
 
     // Numeric, dot-separated comparison (e.g. "2.26.9" < "2.26.10"), not lexicographic.

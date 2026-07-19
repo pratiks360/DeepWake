@@ -133,7 +133,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
                 notifyRow(app, "Scanning " + appName + "...");
 
                 // fetch latest version (still on this background executor)
-                app.latestVersion = PlayStoreVersionFetcher.fetchLatestVersion(info.packageName);
+                app.latestVersion = PlayStoreVersionFetcher.fetchLatestVersion(info.packageName, current);
                 notifyRow(app, "Scanning " + appName + "...");
 
                 // Save after every app, not just at the end, so a mid-scan process kill
