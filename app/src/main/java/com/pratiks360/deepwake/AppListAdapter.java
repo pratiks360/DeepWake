@@ -72,6 +72,10 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         holder.cbSelect.setOnCheckedChangeListener(null);
         holder.cbSelect.setChecked(app.selected);
         holder.cbSelect.setOnCheckedChangeListener((btn, checked) -> app.selected = checked);
+
+        // Tapping anywhere on the row toggles selection (the Update button has its own
+        // click handler and swallows the touch, so it won't also flip the checkbox).
+        holder.itemView.setOnClickListener(v -> holder.cbSelect.toggle());
     }
 
     @Override
