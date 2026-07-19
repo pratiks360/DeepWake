@@ -29,7 +29,10 @@ import java.util.List;
  * the flow - only the overlay's own Cancel button works), then drives the whole loop
  * itself: wake a batch of sleeping apps, open Play Store's updates page, auto-click its
  * "Update all"/"Update" button, wait for the updates to land, next batch - switching
- * between the woken apps and Play Store as needed until every selected app is done.
+ * between the woken apps and Play Store as needed until every selected app is done. On
+ * aggressive-hibernation devices a woken app can slip back to sleep mid-update (Play Store
+ * then stalls it), so while waiting we periodically re-wake any pending app that has gone
+ * back to sleep and re-tap Update all - see maybeRewake.
  *
  * Why an AccessibilityService: it is the only sanctioned mechanism that can (a) click
  * buttons inside another app (Play Store) and (b) draw a TYPE_ACCESSIBILITY_OVERLAY that
@@ -52,6 +55,7 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long VERIFY_INTERVAL_MS = 5000;
     private static final int MAX_VERIFY_TRIES = 24;   // ~2 min per batch
     private static final int MAX_FINAL_TRIES = 24;    // ~2 min extra for stragglers at the end
+    private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
@@ -203,7 +207,47 @@ public class AutoUpdateService extends AccessibilityService {
         } else {
             setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
                     + ": " + still.size() + " app(s) still updating...");
+            maybeRewake(still, tryCount);
             handler.postDelayed(() -> verifyBatch(still, tryCount + 1), VERIFY_INTERVAL_MS);
+        }
+    }
+
+    /**
+     * On aggressive-hibernation devices a woken app slips back to sleep while it sits in the
+     * background waiting to update, and Play Store then stalls/skips it. So every few verify
+     * ticks we re-wake any pending app that has gone back to sleep and hand the foreground
+     * back to Play Store - the back-and-forth that keeps the whole selected list updating.
+     */
+    private void maybeRewake(List<SleepingApp> pending, int tryCount) {
+        if ((tryCount + 1) % REWAKE_EVERY_TICKS != 0) return;
+        List<SleepingApp> asleep = new ArrayList<>();
+        for (SleepingApp app : pending) {
+            if (isAsleep(app.packageName)) asleep.add(app);
+        }
+        if (asleep.isEmpty()) return; // nothing re-slept; the auto-click poll carries on
+        disarmAutoClick(); // don't tap Play Store while we're flipping through the apps
+        rewakeStep(asleep, 0);
+    }
+
+    private void rewakeStep(List<SleepingApp> asleep, int i) {
+        if (!running) return;
+        if (i >= asleep.size()) {
+            // All re-woken - return to Play Store and re-tap Update all for them.
+            openPlayStoreUpdates();
+            armAutoClick();
+            return;
+        }
+        launchApp(asleep.get(i).packageName);
+        handler.postDelayed(() -> rewakeStep(asleep, i + 1), STAGGER_MS);
+    }
+
+    private boolean isAsleep(String packageName) {
+        try {
+            // A tracked app that has fallen back into hibernation reports enabled == false
+            // again (the same signal the scan uses to detect sleeping apps in the first place).
+            return !getPackageManager().getApplicationInfo(packageName, 0).enabled;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
         }
     }
 
@@ -233,6 +277,7 @@ public class AutoUpdateService extends AccessibilityService {
             finishFlow();
         } else {
             setOverlayStatus("Waiting for " + still.size() + " remaining update(s)...");
+            maybeRewake(still, tryCount);
             handler.postDelayed(() -> verifyLeftovers(still, tryCount + 1), VERIFY_INTERVAL_MS);
         }
     }
