@@ -52,8 +52,8 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long VERIFY_INTERVAL_MS = 5000;
     private static final int MAX_VERIFY_TRIES = 24;   // ~2 min per batch
     private static final int MAX_FINAL_TRIES = 24;    // ~2 min extra for stragglers at the end
-    private static final long CLICK_COOLDOWN_MS = 3000;
-    private static final long POLL_INTERVAL_MS = 1200; // retry the click even without events
+    private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
+    private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
     // Accessibility services are singletons managed by the system; this is the standard
@@ -76,12 +76,12 @@ public class AutoUpdateService extends AccessibilityService {
     private int updatedCount;
     private boolean running;
     private boolean autoClickArmed;
-    private long lastClickAttempt;
+    private long lastReopenAttempt;
 
-    // While armed, keep retrying the click on a timer - Play Store's "Update all" button
-    // appears only after the page finishes loading over the network, and relying solely on
-    // accessibility events to catch that moment is unreliable (events can be missed or
-    // throttled). The poll re-posts itself; CLICK_COOLDOWN_MS still rate-limits real taps.
+    // While armed, keep retrying on a timer - Play Store's "Update all" button appears only
+    // after the page finishes loading over the network, and relying solely on accessibility
+    // events to catch that moment is unreliable (events can be missed or throttled). The
+    // poll re-posts itself; see driveToPlayStoreAndClick for the click-then-reopen logic.
     private final Runnable autoClickPoll = new Runnable() {
         @Override
         public void run() {
@@ -175,6 +175,8 @@ public class AutoUpdateService extends AccessibilityService {
 
     private void armAutoClick() {
         autoClickArmed = true;
+        // wakeOne already opened Play Store once; give it the cooldown before re-opening.
+        lastReopenAttempt = System.currentTimeMillis();
         handler.removeCallbacks(autoClickPoll);
         handler.postDelayed(autoClickPoll, POLL_INTERVAL_MS);
     }
@@ -346,40 +348,28 @@ public class AutoUpdateService extends AccessibilityService {
 
     /**
      * The heart of the batch loop's reliability. Every tick (poll + accessibility event):
-     *   1. If Play Store's updates screen isn't actually in front, (re)open it and stop.
-     *      Launching several apps back-to-back can leave the last one stuck on top and the
-     *      one-shot switch to Play Store can be dropped, so instead of switching once and
-     *      hoping, we keep re-asserting Play Store until it's genuinely foreground.
-     *   2. Only once Play Store IS in front do we click its "Update all"/"Update" button.
+     *   1. Try to tap "Update all"/"Update" in Play Store's window. ACTION_CLICK is a
+     *      programmatic click on the node, so it works even though our tint overlay sits on
+     *      top, AND even if Play Store's window isn't flagged "active" (our overlay can steal
+     *      that flag - which is exactly why an isActive()-gated approach never clicked).
+     *      One "Update all" tap triggers every pending update, so we disarm after a hit.
+     *   2. If nothing was tappable (a just-woken app is still on top, or Play Store hasn't
+     *      surfaced yet), re-open Play Store's updates page - rate-limited - so the next tick
+     *      can tap it. Re-opening when Play Store is already front is a harmless re-focus.
      */
     private void driveToPlayStoreAndClick() {
         if (!running || !autoClickArmed) return;
 
-        if (!isPlayStoreForeground()) {
-            openPlayStoreUpdates();
+        if (clickUpdateInPlayStore()) {
+            disarmAutoClick();
             return;
         }
 
         long now = System.currentTimeMillis();
-        if (now - lastClickAttempt < CLICK_COOLDOWN_MS) return;
-        if (clickUpdateInPlayStore()) lastClickAttempt = now;
-    }
-
-    private boolean isPlayStoreForeground() {
-        List<AccessibilityWindowInfo> windows = getWindows();
-        if (windows == null) return false;
-        for (AccessibilityWindowInfo w : windows) {
-            // Our own tint is a (non-focusable) accessibility overlay, so the real
-            // foreground app stays the "active" application window - check that one.
-            if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
-            if (!w.isActive()) continue;
-            AccessibilityNodeInfo root = w.getRoot();
-            if (root != null && root.getPackageName() != null
-                    && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
-                return true;
-            }
+        if (now - lastReopenAttempt >= REOPEN_COOLDOWN_MS) {
+            openPlayStoreUpdates();
+            lastReopenAttempt = now;
         }
-        return false;
     }
 
     private boolean clickUpdateInPlayStore() {
