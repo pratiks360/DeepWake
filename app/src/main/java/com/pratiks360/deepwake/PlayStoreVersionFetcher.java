@@ -91,11 +91,13 @@ public class PlayStoreVersionFetcher {
             //    the per-review "app version" tags Play Store attaches to each review in
             //    the reviews carousel (the version the reviewer had installed at the time),
             //    mixed in with unrelated small numeric tags from the same nested review
-            //    data (rating breakdowns, helpfulness-vote weights, etc). Those unrelated
-            //    tags are usually short (2 segments) and can outrank a real, longer version
-            //    string on pure magnitude, so prefer candidates whose segment count matches
-            //    the installed version's - a real update essentially never changes how many
-            //    dot-separated parts a version string has.
+            //    data (rating breakdowns, helpfulness-vote weights, etc). Matching segment
+            //    count alone isn't enough to filter those out - an app whose own version
+            //    happens to be short (e.g. "3.1") collides with unrelated 2-segment noise
+            //    (e.g. "8.0"), so also require the leading segment to match: a real update
+            //    essentially never changes the major version to something unrelated, but an
+            //    unrelated noise tag has no reason to share it. If nothing matches both, we
+            //    have no reliable signal - NO_MATCH is safer than guessing.
             best = maxVersionToken(page, currentVersion);
             if (best != null) return best;
 
@@ -137,8 +139,10 @@ public class PlayStoreVersionFetcher {
     // The highest version actually seen, restricted to tokens shaped like the installed
     // version, is a much better lower-bound estimate.
     private static String maxVersionToken(String page, String currentVersion) {
-        int wantSegments = (currentVersion != null && !currentVersion.isEmpty())
-                ? currentVersion.split("\\.").length : -1;
+        boolean haveCurrent = currentVersion != null && !currentVersion.isEmpty();
+        String[] currentParts = haveCurrent ? currentVersion.split("\\.") : null;
+        int wantSegments = haveCurrent ? currentParts.length : -1;
+        Integer wantLeading = haveCurrent ? parseSegment(currentParts[0]) : null;
 
         Matcher m = VERSION_TOKEN.matcher(page);
         String bestMatching = null;
@@ -147,12 +151,16 @@ public class PlayStoreVersionFetcher {
             String v = m.group(1);
             if (!isRealVersion(v)) continue;
             if (bestAny == null || compareVersions(v, bestAny) > 0) bestAny = v;
-            if (wantSegments > 0 && v.split("\\.").length == wantSegments
-                    && (bestMatching == null || compareVersions(v, bestMatching) > 0)) {
-                bestMatching = v;
+            if (wantSegments > 0) {
+                String[] vParts = v.split("\\.");
+                if (vParts.length == wantSegments && parseSegment(vParts[0]) == wantLeading
+                        && (bestMatching == null || compareVersions(v, bestMatching) > 0)) {
+                    bestMatching = v;
+                }
             }
         }
-        return bestMatching != null ? bestMatching : bestAny;
+        if (haveCurrent) return bestMatching; // no reliable candidate - NO_MATCH beats a guess
+        return bestAny; // current version unknown - a rough guess is the best available signal
     }
 
     /** True if latest is a strictly newer version than current (numeric, not lexicographic). */
