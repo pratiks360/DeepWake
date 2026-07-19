@@ -13,6 +13,7 @@ import android.view.Gravity;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -85,7 +86,7 @@ public class AutoUpdateService extends AccessibilityService {
         @Override
         public void run() {
             if (!running || !autoClickArmed) return;
-            attemptAutoClick();
+            driveToPlayStoreAndClick();
             handler.postDelayed(this, POLL_INTERVAL_MS);
         }
     };
@@ -300,12 +301,14 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void openPlayStoreUpdates() {
-        Intent deepLink = new Intent("com.google.android.finsky.VIEW_MY_DOWNLOADS");
-        deepLink.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        // Package pinned so this internal action resolves reliably and lands on the
+        // "Downloads / Manage updates" screen (where the "Update all" button lives).
+        Intent deepLink = new Intent("com.google.android.finsky.VIEW_MY_DOWNLOADS")
+                .setPackage(PLAY_STORE_PKG)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         if (tryStart(deepLink)) return;
         // Deep link not handled on this Play Store build - at least bring Play Store up.
-        PackageManager pm = getPackageManager();
-        Intent launch = pm.getLaunchIntentForPackage("com.android.vending");
+        Intent launch = getPackageManager().getLaunchIntentForPackage(PLAY_STORE_PKG);
         if (launch != null) {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             tryStart(launch);
@@ -313,15 +316,16 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private boolean tryStart(Intent intent) {
-        if (intent.resolveActivity(getPackageManager()) != null) {
-            try {
-                startActivity(intent);
-                return true;
-            } catch (Exception e) {
-                Log.w(TAG, "startActivity failed: " + e.getMessage());
-            }
+        // Don't gate on resolveActivity() - internal actions like VIEW_MY_DOWNLOADS often
+        // won't resolve implicitly even though startActivity() launches them fine. Just try
+        // it and let the exception path fall through to the caller's fallback.
+        try {
+            startActivity(intent);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "startActivity failed: " + e.getMessage());
+            return false;
         }
-        return false;
     }
 
     private void bringDeepWakeToFront() {
@@ -337,41 +341,69 @@ public class AutoUpdateService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         // Events are one trigger; the poll (armAutoClick) is the other. Both funnel here.
-        attemptAutoClick();
+        driveToPlayStoreAndClick();
     }
 
-    private void attemptAutoClick() {
+    /**
+     * The heart of the batch loop's reliability. Every tick (poll + accessibility event):
+     *   1. If Play Store's updates screen isn't actually in front, (re)open it and stop.
+     *      Launching several apps back-to-back can leave the last one stuck on top and the
+     *      one-shot switch to Play Store can be dropped, so instead of switching once and
+     *      hoping, we keep re-asserting Play Store until it's genuinely foreground.
+     *   2. Only once Play Store IS in front do we click its "Update all"/"Update" button.
+     */
+    private void driveToPlayStoreAndClick() {
         if (!running || !autoClickArmed) return;
+
+        if (!isPlayStoreForeground()) {
+            openPlayStoreUpdates();
+            return;
+        }
+
         long now = System.currentTimeMillis();
         if (now - lastClickAttempt < CLICK_COOLDOWN_MS) return;
+        if (clickUpdateInPlayStore()) lastClickAttempt = now;
+    }
 
-        // Our own full-screen tint is an accessibility overlay window that can be reported
-        // as the "active" window, so getRootInActiveWindow() may hand back DeepWake's
-        // overlay (which has no Update button) instead of Play Store. Walk every window and
-        // act only on the one that actually belongs to Play Store.
-        boolean clicked = false;
-        List<android.view.accessibility.AccessibilityWindowInfo> windows = getWindows();
+    private boolean isPlayStoreForeground() {
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows == null) return false;
+        for (AccessibilityWindowInfo w : windows) {
+            // Our own tint is a (non-focusable) accessibility overlay, so the real
+            // foreground app stays the "active" application window - check that one.
+            if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+            if (!w.isActive()) continue;
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root != null && root.getPackageName() != null
+                    && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean clickUpdateInPlayStore() {
+        // Walk every window and act only on Play Store's - getRootInActiveWindow() can hand
+        // back our own overlay window instead, which has no Update button.
+        List<AccessibilityWindowInfo> windows = getWindows();
         if (windows != null) {
-            for (android.view.accessibility.AccessibilityWindowInfo w : windows) {
+            for (AccessibilityWindowInfo w : windows) {
                 AccessibilityNodeInfo root = w.getRoot();
                 if (root == null) continue;
                 CharSequence pkg = root.getPackageName();
                 if (pkg == null || !PLAY_STORE_PKG.contentEquals(pkg)) continue;
                 if (clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update")) {
-                    clicked = true;
-                    break;
+                    return true;
                 }
             }
         }
-        if (!clicked) {
-            // Fallback for devices/versions where getWindows() returns nothing usable.
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null && root.getPackageName() != null
-                    && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
-                clicked = clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update");
-            }
+        // Fallback for devices/versions where getWindows() returns nothing usable.
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null && root.getPackageName() != null
+                && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
+            return clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update");
         }
-        if (clicked) lastClickAttempt = now;
+        return false;
     }
 
     private boolean clickButtonLabeled(AccessibilityNodeInfo root, String label) {
