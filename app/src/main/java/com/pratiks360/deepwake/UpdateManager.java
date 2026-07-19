@@ -12,14 +12,14 @@ import java.util.List;
 
 /**
  * Wakes sleeping apps in small batches (default 4) instead of all at once, so the phone
- * isn't slammed launching many apps together. Play Store's "Manage apps & device" updates
- * screen is opened before each batch and re-opened right after every app launch, since
- * Android has no way to wake an app without briefly foregrounding it - this keeps Play
- * Store as the screen the user actually sees, with each app only flashing on screen for
- * WAKE_FLASH_MS. It then periodically re-checks each app: an app is only marked updated
- * once its live installed version differs from the version recorded at scan time
- * (currentVersion). This is robust to the app going back to sleep mid-update - only the
- * version number moving matters, not the app's enabled/sleep state.
+ * isn't slammed launching many apps together. Each batch is launched back-to-back with a
+ * short stagger, then Play Store's "Manage apps & device" updates screen is opened once
+ * the batch is done - waking batches never waits on update verification, so later batches
+ * aren't stalled behind an earlier one that hasn't updated yet. Once every batch has been
+ * woken, a single verification pass periodically re-checks all of them together: an app is
+ * only marked updated once its live installed version differs from the version recorded at
+ * scan time (currentVersion). This is robust to the app going back to sleep mid-update -
+ * only the version number moving matters, not the app's enabled/sleep state.
  *
  * Note: a third-party app cannot silently force-install another app's update. This wakes
  * the apps so Play Store sees them as active/outdated; the user taps "Update all" in Play
@@ -29,9 +29,8 @@ public class UpdateManager {
 
     private static final int BATCH_SIZE = 4;
     private static final long STAGGER_MS = 1200;
-    private static final long WAKE_FLASH_MS = 350; // how long a woken app is allowed on screen before Play Store reclaims it
     private static final long VERIFY_INTERVAL_MS = 5000;
-    private static final int MAX_VERIFY_TRIES = 12; // ~1 min per batch before moving on
+    private static final int MAX_VERIFY_TRIES = 24; // ~2 min verification window
 
     public interface Listener {
         void onAppUpdated(SleepingApp app);
@@ -76,28 +75,38 @@ public class UpdateManager {
 
     private void runNextBatch() {
         if (batches == null || batchIndex >= batches.size()) {
-            listener.onAllDone();
+            beginVerification();
             return;
         }
         List<SleepingApp> batch = batches.get(batchIndex);
         listener.onBatchStarted(batch);
-        // Show Play Store's updates screen right away; each app below only flashes
-        // on screen briefly to wake it, then Play Store reclaims the foreground.
-        openPlayStoreUpdates();
-        handler.postDelayed(() -> wakeAppsStaggered(batch, 0), WAKE_FLASH_MS);
+        wakeAppsStaggered(batch, 0);
     }
 
     private void wakeAppsStaggered(List<SleepingApp> batch, int i) {
         if (i >= batch.size()) {
-            handler.postDelayed(() -> verifyBatch(batch, 0), VERIFY_INTERVAL_MS);
+            // Whole batch launched - settle on Play Store's updates screen once, then
+            // move on to the next batch instead of waiting for these to finish updating.
+            openPlayStoreUpdates();
+            batchIndex++;
+            handler.postDelayed(this::runNextBatch, STAGGER_MS);
             return;
         }
         launchApp(batch.get(i).packageName);
-        handler.postDelayed(this::openPlayStoreUpdates, WAKE_FLASH_MS);
         handler.postDelayed(() -> wakeAppsStaggered(batch, i + 1), STAGGER_MS);
     }
 
-    private void verifyBatch(List<SleepingApp> pending, int tryCount) {
+    private void beginVerification() {
+        List<SleepingApp> all = new ArrayList<>();
+        for (List<SleepingApp> b : batches) all.addAll(b);
+        if (all.isEmpty()) {
+            listener.onAllDone();
+            return;
+        }
+        handler.postDelayed(() -> verifyPending(all, 0), VERIFY_INTERVAL_MS);
+    }
+
+    private void verifyPending(List<SleepingApp> pending, int tryCount) {
         List<SleepingApp> stillPending = new ArrayList<>();
         for (SleepingApp app : pending) {
             String installed = getInstalledVersion(app.packageName);
@@ -121,10 +130,9 @@ public class UpdateManager {
         }
 
         if (stillPending.isEmpty() || tryCount + 1 >= MAX_VERIFY_TRIES) {
-            batchIndex++;
-            runNextBatch();
+            listener.onAllDone();
         } else {
-            handler.postDelayed(() -> verifyBatch(stillPending, tryCount + 1), VERIFY_INTERVAL_MS);
+            handler.postDelayed(() -> verifyPending(stillPending, tryCount + 1), VERIFY_INTERVAL_MS);
         }
     }
 
@@ -147,10 +155,27 @@ public class UpdateManager {
     }
 
     private void openPlayStoreUpdates() {
-        Intent intent = new Intent("com.google.android.finsky.VIEW_MY_DOWNLOADS");
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Intent deepLink = new Intent("com.google.android.finsky.VIEW_MY_DOWNLOADS");
+        deepLink.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (tryStart(deepLink)) return;
+
+        // The internal deep link isn't handled on this Play Store build/version - fall
+        // back to just bringing Play Store itself to the foreground (its own launcher
+        // intent is always resolvable) rather than silently no-op'ing and leaving
+        // whichever app we just launched sitting on screen.
+        PackageManager pm = context.getPackageManager();
+        Intent launch = pm.getLaunchIntentForPackage("com.android.vending");
+        if (launch != null) {
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            tryStart(launch);
+        }
+    }
+
+    private boolean tryStart(Intent intent) {
         if (intent.resolveActivity(context.getPackageManager()) != null) {
             context.startActivity(intent);
+            return true;
         }
+        return false;
     }
 }
