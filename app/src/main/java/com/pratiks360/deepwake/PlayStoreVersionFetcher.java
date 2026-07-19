@@ -7,8 +7,6 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -84,9 +82,11 @@ public class PlayStoreVersionFetcher {
             String best = findNearAnchor(page);
             if (best != null) return best;
 
-            // 3) Fallback: the most frequent version-shaped token on the page is
-            //    very often the current version (it repeats in several data blocks).
-            best = mostFrequentVersionToken(page);
+            // 3) Fallback: Play Store no longer exposes a labeled version field on the
+            //    public listing page. The only version-shaped tokens left on the page are
+            //    the per-review "app version" tags Play Store attaches to each review in
+            //    the reviews carousel (the version the reviewer had installed at the time).
+            best = maxVersionToken(page);
             if (best != null) return best;
 
             // Nothing usable - log a hint around the first anchor so we can refine.
@@ -121,22 +121,41 @@ public class PlayStoreVersionFetcher {
         return null;
     }
 
-    private static String mostFrequentVersionToken(String page) {
-        List<String> tokens = new ArrayList<>();
+    // Reviewers skew toward whatever version they installed a while ago, so older
+    // releases accumulate far more tagged reviews than the newest one - picking the
+    // most-frequent token (the previous strategy) systematically returns a stale
+    // version and can look like a "major mismatch" against the real current version.
+    // The highest version actually seen is a much better lower-bound estimate.
+    private static String maxVersionToken(String page) {
         Matcher m = VERSION_TOKEN.matcher(page);
+        String best = null;
         while (m.find()) {
             String v = m.group(1);
-            if (isRealVersion(v)) tokens.add(v);
+            if (!isRealVersion(v)) continue;
+            if (best == null || compareVersions(v, best) > 0) best = v;
         }
-        if (tokens.isEmpty()) return null;
-        String bestVal = null;
-        int bestCount = 0;
-        for (String t : tokens) {
-            int c = 0;
-            for (String o : tokens) if (o.equals(t)) c++;
-            if (c > bestCount) { bestCount = c; bestVal = t; }
+        return best;
+    }
+
+    // Numeric, dot-separated comparison (e.g. "2.26.9" < "2.26.10"), not lexicographic.
+    private static int compareVersions(String a, String b) {
+        String[] pa = a.split("\\.");
+        String[] pb = b.split("\\.");
+        int len = Math.max(pa.length, pb.length);
+        for (int i = 0; i < len; i++) {
+            int va = i < pa.length ? parseSegment(pa[i]) : 0;
+            int vb = i < pb.length ? parseSegment(pb[i]) : 0;
+            if (va != vb) return Integer.compare(va, vb);
         }
-        return bestVal;
+        return 0;
+    }
+
+    private static int parseSegment(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     // Filters out things that are version-shaped but clearly not app versions
@@ -153,8 +172,8 @@ public class PlayStoreVersionFetcher {
         // Play Store embeds its star rating as a bare "X.Y" token (e.g. "4.6", always
         // 0.0-5.0 with exactly one decimal digit) in several places on the page - that
         // shape is indistinguishable from a short version number except by range, and
-        // it appears often enough to win the frequency-based fallback below, which was
-        // showing the rating as the "latest version". Reject it.
+        // it was winning the version-picking fallback above, which showed the rating as
+        // the "latest version". Reject it.
         if (parts.length == 2 && parts[1].length() == 1) {
             try {
                 double d = Double.parseDouble(v);
