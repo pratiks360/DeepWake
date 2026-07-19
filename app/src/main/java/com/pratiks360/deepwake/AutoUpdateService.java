@@ -397,24 +397,43 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private boolean clickButtonLabeled(AccessibilityNodeInfo root, String label) {
-        List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText(label);
-        if (nodes == null) return false;
-        for (AccessibilityNodeInfo node : nodes) {
-            // findAccessibilityNodeInfosByText is a case-insensitive SUBSTRING match, so
-            // "Update" would also hit "Updated on Jul 18" or "Updates available" - require
-            // the node's own label to be exactly the button text before clicking anything.
-            CharSequence text = node.getText();
-            if (text == null || !text.toString().trim().equalsIgnoreCase(label)) continue;
+        // Full-tree DFS rather than findAccessibilityNodeInfosByText(), which can miss
+        // Compose-rendered elements - and on the "Manage apps & device" Overview screen
+        // "Update all" is a Compose text link, not a classic Button, so the old shallow
+        // lookup found nothing clickable and never tapped it.
+        return clickByLabelDfs(root, label, 0);
+    }
 
-            AccessibilityNodeInfo target = node;
-            for (int depth = 0; target != null && depth < 5; depth++) {
-                if (target.isClickable() && target.isEnabled()) {
-                    return target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                }
-                target = target.getParent();
-            }
+    private boolean clickByLabelDfs(AccessibilityNodeInfo node, String label, int depth) {
+        if (node == null || depth > 40) return false;
+        if (labelMatches(node, label) && clickSelfOrAncestor(node)) return true;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (clickByLabelDfs(node.getChild(i), label, depth + 1)) return true;
         }
         return false;
+    }
+
+    private boolean labelMatches(AccessibilityNodeInfo node, String label) {
+        // Exact (trimmed, case-insensitive) match on text OR content-description, so
+        // "Update" matches the button but never "Updated on Jul 18" / "Updates available".
+        CharSequence text = node.getText();
+        if (text != null && text.toString().trim().equalsIgnoreCase(label)) return true;
+        CharSequence desc = node.getContentDescription();
+        return desc != null && desc.toString().trim().equalsIgnoreCase(label);
+    }
+
+    private boolean clickSelfOrAncestor(AccessibilityNodeInfo node) {
+        // Prefer the nearest clickable+enabled ancestor (classic Button case)...
+        AccessibilityNodeInfo target = node;
+        for (int depth = 0; target != null && depth < 6; depth++) {
+            if (target.isClickable() && target.isEnabled()) {
+                if (target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+            }
+            target = target.getParent();
+        }
+        // ...otherwise click the labelled node directly. Compose links often carry the
+        // click action on the text node itself without reporting isClickable().
+        return node.isEnabled() && node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     // ---------------------------------------------------------------- overlay
