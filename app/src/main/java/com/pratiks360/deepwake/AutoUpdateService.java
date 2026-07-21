@@ -237,13 +237,50 @@ public class AutoUpdateService extends AccessibilityService {
     private void rewakeStep(List<SleepingApp> asleep, int i) {
         if (!running) return;
         if (i >= asleep.size()) {
-            // All re-woken - return to Play Store and re-tap Update all for them.
+            // All re-woken - return to Play Store, force it to RE-CHECK for updates so the
+            // apps that slept (and dropped off the cached "Available updates" list) show up
+            // again, then re-tap Update all.
             openPlayStoreUpdates();
+            handler.postDelayed(this::refreshPlayStore, 1500); // let Downloads load first
             armAutoClick();
             return;
         }
         launchApp(asleep.get(i).packageName);
         handler.postDelayed(() -> rewakeStep(asleep, i + 1), STAGGER_MS);
+    }
+
+    /**
+     * Forces Play Store to re-scan for updates. When a woken app falls back asleep mid-run
+     * Play Store drops it from the cached Downloads list and won't re-add it on its own;
+     * re-launching the app un-sleeps it but Play Store still needs a refresh to notice.
+     * Tries a "Check for updates" control if the build has one, else pull-to-refresh
+     * (scroll the list up), which triggers the SwipeRefresh on the Downloads screen.
+     */
+    private void refreshPlayStore() {
+        if (!running) return;
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows == null) return;
+        for (AccessibilityWindowInfo w : windows) {
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root == null) continue;
+            CharSequence pkg = root.getPackageName();
+            if (pkg == null || !PLAY_STORE_PKG.contentEquals(pkg)) continue;
+            if (clickByLabelDfs(root, "Check for updates", 0)) return;
+            scrollRefresh(root, 0); // pull-to-refresh fallback
+            return;
+        }
+    }
+
+    private boolean scrollRefresh(AccessibilityNodeInfo node, int depth) {
+        if (node == null || depth > 40) return false;
+        if (node.isScrollable()
+                && node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
+            return true;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (scrollRefresh(node.getChild(i), depth + 1)) return true;
+        }
+        return false;
     }
 
     private boolean allAwake() {
