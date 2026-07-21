@@ -147,7 +147,18 @@ public class ScanService extends Service implements UpdateManager.Listener {
 
                 String current = getInstalledVersion(pm, info.packageName);
                 String appName = String.valueOf(pm.getApplicationLabel(info));
-                SleepingApp app = new SleepingApp(info.packageName, appName, current, "checking...");
+
+                // Seed with the previously-known latest version if we have one, instead of
+                // wiping it to "checking...". Otherwise an interrupted rescan (this device
+                // kills background work aggressively) would persist every app as
+                // "checking..." - which filters out as not-outdated and leaves the list
+                // empty on the next open. Keeping the prior value means the list survives.
+                SleepingApp prior = merged.get(info.packageName);
+                String prevLatest = prior != null ? prior.latestVersion : null;
+                String seedLatest = (prevLatest != null && !prevLatest.isEmpty()
+                        && !prevLatest.equals("checking...")) ? prevLatest : "checking...";
+
+                SleepingApp app = new SleepingApp(info.packageName, appName, current, seedLatest);
                 merged.put(info.packageName, app);
                 toFetch.add(app);
                 notifyRow(app, "Found " + appName + "...");
