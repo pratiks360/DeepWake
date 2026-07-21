@@ -55,8 +55,10 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long STAGGER_MS = 700;       // between app launches
     private static final long SETTLE_MS = 800;        // after last launch, before Play Store
     private static final long VERIFY_INTERVAL_MS = 5000;
-    private static final int GLOBAL_MAX_TICKS = 90;   // ~7.5 min hard cap, then auto-finish
-    private static final int STALL_TICKS = 18;        // ~90s with zero progress -> finish
+    private static final int GLOBAL_MAX_TICKS = 180;  // ~15 min hard cap, then auto-finish
+    private static final int STALL_TICKS = 36;        // ~3 min zero progress -> finish (Play
+                                                      // Store installs one app at a time, so
+                                                      // a big app can hold progress a while)
     private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
@@ -510,7 +512,11 @@ public class AutoUpdateService extends AccessibilityService {
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                    // KEEP_SCREEN_ON: while the shade is up the screen can't time out and
+                    // lock. A screen lock mid-run pauses Play Store's downloads and blocks
+                    // our app/Play Store launches, which was leaving half the batch un-updated.
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSLUCENT);
             windowManager.addView(box, lp);
             overlay = box;
