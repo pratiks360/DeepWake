@@ -21,18 +21,21 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 /**
  * Fully automated batch updating, SD-Maid style: while a batch run is active this service
  * draws a full-screen tint overlay that swallows all touches (so the user can't disturb
  * the flow - only the overlay's own Cancel button works), then drives the whole loop
- * itself: wake a batch of sleeping apps, open Play Store's updates page, auto-click its
- * "Update all"/"Update" button, wait for the updates to land, next batch - switching
- * between the woken apps and Play Store as needed until every selected app is done. On
- * aggressive-hibernation devices a woken app can slip back to sleep mid-update (Play Store
- * then stalls it), so while waiting we periodically re-wake any pending app that has gone
- * back to sleep and re-tap Update all - see maybeRewake.
+ * itself: wake ALL the selected apps, open Play Store's updates page, auto-click its
+ * "Update all" button (which queues every pending update at once), then monitor the whole
+ * set until each app's installed version actually moves - switching between the woken apps
+ * and Play Store as needed. On aggressive-hibernation devices a woken app can slip back to
+ * sleep mid-update (Play Store then stalls it), so while waiting we periodically re-wake any
+ * pending app that has gone back to sleep and re-tap Update all - see maybeRewake. The run
+ * always finishes on its own (all done / no progress for a while / a hard time cap) so the
+ * overlay never sits on Play Store forever waiting for the user to cancel.
  *
  * Why an AccessibilityService: it is the only sanctioned mechanism that can (a) click
  * buttons inside another app (Play Store) and (b) draw a TYPE_ACCESSIBILITY_OVERLAY that
@@ -49,12 +52,11 @@ public class AutoUpdateService extends AccessibilityService {
 
     private static final String TAG = "DeepWakeAuto";
 
-    private static final int BATCH_SIZE = 4;
-    private static final long STAGGER_MS = 800;       // between app launches in a batch
-    private static final long SETTLE_MS = 600;        // after last launch, before Play Store
+    private static final long STAGGER_MS = 700;       // between app launches
+    private static final long SETTLE_MS = 800;        // after last launch, before Play Store
     private static final long VERIFY_INTERVAL_MS = 5000;
-    private static final int MAX_VERIFY_TRIES = 24;   // ~2 min per batch
-    private static final int MAX_FINAL_TRIES = 24;    // ~2 min extra for stragglers at the end
+    private static final int GLOBAL_MAX_TICKS = 90;   // ~7.5 min hard cap, then auto-finish
+    private static final int STALL_TICKS = 18;        // ~90s with zero progress -> finish
     private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
@@ -74,10 +76,12 @@ public class AutoUpdateService extends AccessibilityService {
     private LinearLayout overlay;
     private TextView overlayStatus;
 
-    private List<List<SleepingApp>> batches;
-    private int batchIndex;
-    private final List<SleepingApp> leftovers = new ArrayList<>();
+    // The whole selected set is treated as one working list - Play Store's "Update all"
+    // queues every pending update at once, so there's no reason to wait on isolated batches.
+    private final List<SleepingApp> pending = new ArrayList<>();
+    private int totalSelected;
     private int updatedCount;
+    private int lastProgressTick; // tick at which updatedCount last increased
     private boolean running;
     private boolean autoClickArmed;
     private long lastReopenAttempt;
@@ -130,56 +134,77 @@ public class AutoUpdateService extends AccessibilityService {
         if (running || apps == null || apps.isEmpty()) return;
         running = true;
         updatedCount = 0;
-        leftovers.clear();
-        batches = chunk(apps, BATCH_SIZE);
-        batchIndex = 0;
+        lastProgressTick = 0;
+        pending.clear();
+        pending.addAll(apps);
+        totalSelected = pending.size();
         showOverlay();
-        handler.post(this::runNextBatch);
+        handler.post(() -> wakeAll(0));
     }
 
-    private List<List<SleepingApp>> chunk(List<SleepingApp> apps, int size) {
-        List<List<SleepingApp>> out = new ArrayList<>();
-        for (int i = 0; i < apps.size(); i += size) {
-            out.add(new ArrayList<>(apps.subList(i, Math.min(i + size, apps.size()))));
-        }
-        return out;
-    }
-
-    private void runNextBatch() {
+    /** Wake every selected app (staggered), then hand off to Play Store + the monitor loop. */
+    private void wakeAll(int i) {
         if (!running) return;
-        if (batchIndex >= batches.size()) {
-            finalVerification();
-            return;
-        }
-        // Don't click while we're busy launching apps - only once we're on Play Store.
-        disarmAutoClick();
-        List<SleepingApp> batch = batches.get(batchIndex);
-        setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
-                + ": waking " + batch.size() + " app(s)...");
-        wakeOne(batch, 0);
-    }
-
-    private void wakeOne(List<SleepingApp> batch, int i) {
-        if (!running) return;
-        if (i >= batch.size()) {
-            // The WHOLE batch is open now - only at this point switch to Play Store.
+        if (i >= pending.size()) {
             handler.postDelayed(() -> {
                 if (!running) return;
                 openPlayStoreUpdates();
-                setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
-                        + ": waiting for Play Store to update " + batch.size() + " app(s)...");
                 armAutoClick();
-                handler.postDelayed(() -> verifyBatch(new ArrayList<>(batch), 0), VERIFY_INTERVAL_MS);
+                setOverlayStatus("Waiting for Play Store to update "
+                        + pending.size() + " app(s)...");
+                handler.postDelayed(() -> monitor(0), VERIFY_INTERVAL_MS);
             }, SETTLE_MS);
             return;
         }
-        launchApp(batch.get(i).packageName);
-        handler.postDelayed(() -> wakeOne(batch, i + 1), STAGGER_MS);
+        setOverlayStatus("Waking apps... (" + (i + 1) + "/" + pending.size() + ")");
+        launchApp(pending.get(i).packageName);
+        handler.postDelayed(() -> wakeAll(i + 1), STAGGER_MS);
+    }
+
+    /**
+     * Single loop over the whole selected set: sweep for completed updates, re-wake any app
+     * that slipped back to sleep, keep Play Store tapping "Update all", and terminate when
+     * everything's done, when there's been no progress for a while, or at the hard cap - so
+     * the overlay always dismisses itself instead of sitting on Play Store forever.
+     */
+    private void monitor(int tick) {
+        if (!running) return;
+
+        boolean progressed = false;
+        Iterator<SleepingApp> it = pending.iterator();
+        while (it.hasNext()) {
+            SleepingApp app = it.next();
+            if (isUpdated(app)) {
+                markUpdated(app); // increments updatedCount + drops it from stored list
+                it.remove();
+                progressed = true;
+            }
+        }
+        if (progressed) lastProgressTick = tick;
+
+        setOverlayStatus(updatedCount + "/" + totalSelected + " updated, "
+                + pending.size() + " remaining...");
+
+        if (pending.isEmpty()) {
+            finishFlow();
+            return;
+        }
+        // Stop if we've hit the hard cap, or if nothing has updated for a while AND nothing
+        // is still asleep (so re-waking has nothing left to try - Play Store simply has no
+        // more updates to give, e.g. false-positive "outdated" entries).
+        boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake();
+        if (tick + 1 >= GLOBAL_MAX_TICKS || stalled) {
+            finishFlow();
+            return;
+        }
+
+        maybeRewake(tick);
+        handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
     }
 
     private void armAutoClick() {
         autoClickArmed = true;
-        // wakeOne already opened Play Store once; give it the cooldown before re-opening.
+        // Play Store was just opened; give it the cooldown before the poll re-opens it.
         lastReopenAttempt = System.currentTimeMillis();
         handler.removeCallbacks(autoClickPoll);
         handler.postDelayed(autoClickPoll, POLL_INTERVAL_MS);
@@ -190,36 +215,14 @@ public class AutoUpdateService extends AccessibilityService {
         handler.removeCallbacks(autoClickPoll);
     }
 
-    private void verifyBatch(List<SleepingApp> pending, int tryCount) {
-        if (!running) return;
-        List<SleepingApp> still = new ArrayList<>();
-        for (SleepingApp app : pending) {
-            if (isUpdated(app)) markUpdated(app);
-            else still.add(app);
-        }
-
-        if (still.isEmpty() || tryCount + 1 >= MAX_VERIFY_TRIES) {
-            // Timeout doesn't kill the run - unfinished apps get one more chance in the
-            // final verification pass while later batches proceed.
-            leftovers.addAll(still);
-            batchIndex++;
-            runNextBatch();
-        } else {
-            setOverlayStatus("Batch " + (batchIndex + 1) + "/" + batches.size()
-                    + ": " + still.size() + " app(s) still updating...");
-            maybeRewake(still, tryCount);
-            handler.postDelayed(() -> verifyBatch(still, tryCount + 1), VERIFY_INTERVAL_MS);
-        }
-    }
-
     /**
-     * On aggressive-hibernation devices a woken app slips back to sleep while it sits in the
-     * background waiting to update, and Play Store then stalls/skips it. So every few verify
-     * ticks we re-wake any pending app that has gone back to sleep and hand the foreground
-     * back to Play Store - the back-and-forth that keeps the whole selected list updating.
+     * On aggressive-hibernation devices a woken app slips back to sleep while it waits in the
+     * background to update, and Play Store then stalls/skips it. Every few ticks we re-wake
+     * any pending app that has gone back to sleep and hand the foreground back to Play Store -
+     * the back-and-forth that keeps the whole selected list moving toward updated.
      */
-    private void maybeRewake(List<SleepingApp> pending, int tryCount) {
-        if ((tryCount + 1) % REWAKE_EVERY_TICKS != 0) return;
+    private void maybeRewake(int tick) {
+        if ((tick + 1) % REWAKE_EVERY_TICKS != 0) return;
         List<SleepingApp> asleep = new ArrayList<>();
         for (SleepingApp app : pending) {
             if (isAsleep(app.packageName)) asleep.add(app);
@@ -241,6 +244,13 @@ public class AutoUpdateService extends AccessibilityService {
         handler.postDelayed(() -> rewakeStep(asleep, i + 1), STAGGER_MS);
     }
 
+    private boolean allAwake() {
+        for (SleepingApp app : pending) {
+            if (isAsleep(app.packageName)) return false;
+        }
+        return true;
+    }
+
     private boolean isAsleep(String packageName) {
         try {
             // A tracked app that has fallen back into hibernation reports enabled == false
@@ -251,42 +261,11 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
-    private void finalVerification() {
-        if (!running) return;
-        if (leftovers.isEmpty()) {
-            finishFlow();
-            return;
-        }
-        // Play Store is still in front from the last batch; keep clicking any Update button
-        // that's still showing while the stragglers finish.
-        armAutoClick();
-        setOverlayStatus("Waiting for " + leftovers.size() + " remaining update(s)...");
-        verifyLeftovers(new ArrayList<>(leftovers), 0);
-    }
-
-    private void verifyLeftovers(List<SleepingApp> pending, int tryCount) {
-        if (!running) return;
-        List<SleepingApp> still = new ArrayList<>();
-        for (SleepingApp app : pending) {
-            if (isUpdated(app)) markUpdated(app);
-            else still.add(app);
-        }
-        if (still.isEmpty() || tryCount + 1 >= MAX_FINAL_TRIES) {
-            leftovers.clear();
-            leftovers.addAll(still);
-            finishFlow();
-        } else {
-            setOverlayStatus("Waiting for " + still.size() + " remaining update(s)...");
-            maybeRewake(still, tryCount);
-            handler.postDelayed(() -> verifyLeftovers(still, tryCount + 1), VERIFY_INTERVAL_MS);
-        }
-    }
-
     private void finishFlow() {
-        int pendingCount = leftovers.size();
+        int pend = pending.size();
         stopFlowInternal();
         Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
-                + (pendingCount > 0 ? ", " + pendingCount + " still pending" : ""),
+                + (pend > 0 ? ", " + pend + " still pending" : ""),
                 Toast.LENGTH_LONG).show();
         bringDeepWakeToFront();
     }
