@@ -10,22 +10,39 @@ android {
         applicationId "com.pratiks360.deepwake"
         minSdk 26
         targetSdk 33
-        versionCode 7
+        versionCode 8
         versionName "0.${versionCode}"
     }
 
-    // A persistent signing key, fed via env vars (locally or from GitHub secrets in CI).
-    // Without this every CI runner generates its own throwaway debug keystore, so each
-    // downloaded APK has a different signature and Android refuses to install it over the
-    // previous one ("App not updated") - forcing an uninstall/reinstall every time.
+    // A persistent signing key: env vars first (GitHub secrets in CI), else the untracked
+    // signing/ folder for local builds - so every APK, CI or local, carries the SAME
+    // signature. Without it Gradle falls back to a per-machine throwaway debug keystore
+    // and Android refuses to install the APK over the previous one ("App not updated"),
+    // forcing an uninstall/reinstall every time.
     def ksFile = System.getenv("DEEPWAKE_KEYSTORE_FILE")
+    def ksPass = System.getenv("DEEPWAKE_KEYSTORE_PASSWORD")
+    def ksAlias = System.getenv("DEEPWAKE_KEY_ALIAS")
+    def ksKeyPass = System.getenv("DEEPWAKE_KEY_PASSWORD")
+    if (ksFile == null) {
+        def localKs = rootProject.file("signing/deepwake-release.keystore")
+        def localInfo = rootProject.file("signing/SIGNING-INFO.txt")
+        if (localKs.exists() && localInfo.exists()) {
+            def m = localInfo.text =~ /Store password: (\S+)/
+            if (m.find()) {
+                ksFile = localKs.path
+                ksPass = m.group(1)
+                ksAlias = "deepwake"
+                ksKeyPass = ksPass
+            }
+        }
+    }
     signingConfigs {
         deepwake {
             if (ksFile != null) {
                 storeFile file(ksFile)
-                storePassword System.getenv("DEEPWAKE_KEYSTORE_PASSWORD")
-                keyAlias System.getenv("DEEPWAKE_KEY_ALIAS")
-                keyPassword System.getenv("DEEPWAKE_KEY_PASSWORD")
+                storePassword ksPass
+                keyAlias ksAlias
+                keyPassword ksKeyPass
             }
         }
     }

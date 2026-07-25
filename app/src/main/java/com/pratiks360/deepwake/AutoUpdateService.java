@@ -69,6 +69,7 @@ public class AutoUpdateService extends AccessibilityService {
     private static final int RESTART_PS_TICKS = 9;    // ~45s zero progress with everything
                                                       // awake -> kill + reopen Play Store
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
+    private static final long REOPEN_SETTLED_COOLDOWN_MS = 12000; // ...while Play Store is front
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
@@ -279,9 +280,31 @@ public class AutoUpdateService extends AccessibilityService {
                 // the pull-to-refresh in the rewake path can catch it on a later tick.
                 Log.w(TAG, "killBackgroundProcesses failed: " + e.getMessage());
             }
-            openPlayStoreUpdates();
-            armAutoClick();
+            // Re-launch every pending app BEFORE the cold reload. Between the restart
+            // decision and Play Store's re-check an app can slip back to sleep (and some
+            // sleep states never flip the enabled flag, so allAwake() can't see them);
+            // if it's asleep when the fresh page loads, Play Store truthfully reports
+            // "All apps up to date" and the batch wedges on that screen. Launching an
+            // already-awake app costs only a brief flash, so wake them all unconditionally.
+            rewakePendingThenReopen(0);
         }, 800);
+    }
+
+    private void rewakePendingThenReopen(int i) {
+        if (!running) return;
+        if (i >= pending.size()) {
+            handler.postDelayed(() -> {
+                if (!running) return;
+                openPlayStoreUpdates();
+                // A cold start can still render the updates list from cache; nudge an
+                // explicit re-check once the page has had a moment to load.
+                handler.postDelayed(this::refreshPlayStore, 2500);
+                armAutoClick();
+            }, SETTLE_MS);
+            return;
+        }
+        launchApp(pending.get(i).packageName);
+        handler.postDelayed(() -> rewakePendingThenReopen(i + 1), STAGGER_MS);
     }
 
     private String batchLabel() {
@@ -522,10 +545,29 @@ public class AutoUpdateService extends AccessibilityService {
         }
 
         long now = System.currentTimeMillis();
-        if (now - lastReopenAttempt >= REOPEN_COOLDOWN_MS) {
+        // Re-firing the deep link restarts the updates page's load from scratch. When Play
+        // Store is already on screen and just slow to list updates, re-opening it every
+        // couple of seconds means the check NEVER completes - the page sits on a spinner
+        // (or a stale "up to date") indefinitely. So while Play Store is front, hold off
+        // much longer; the short cooldown is only for shoving aside a woken app that is
+        // still covering the screen.
+        long cooldown = isPlayStoreShowing() ? REOPEN_SETTLED_COOLDOWN_MS : REOPEN_COOLDOWN_MS;
+        if (now - lastReopenAttempt >= cooldown) {
             openPlayStoreUpdates();
             lastReopenAttempt = now;
         }
+    }
+
+    private boolean isPlayStoreShowing() {
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows == null) return false;
+        for (AccessibilityWindowInfo w : windows) {
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root == null) continue;
+            CharSequence pkg = root.getPackageName();
+            if (pkg != null && PLAY_STORE_PKG.contentEquals(pkg)) return true;
+        }
+        return false;
     }
 
     private boolean clickUpdateInPlayStore() {
