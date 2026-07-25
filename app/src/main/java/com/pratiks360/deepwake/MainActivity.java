@@ -2,11 +2,13 @@ package com.pratiks360.deepwake;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
@@ -70,7 +72,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         adapter = new AppListAdapter(appList, app -> {
             if (scanService != null) scanService.startUpdateSingle(app);
-        });
+        }, this::updateSelectionCount);
         recyclerView.setAdapter(adapter);
 
         reloadFromStorage();
@@ -90,6 +92,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
         cbSelectAll.setOnCheckedChangeListener((btn, checked) -> {
             for (SleepingApp a : appList) a.selected = checked;
             adapter.notifyDataSetChanged();
+            updateSelectionCount();
         });
         btnUpdateAll.setOnClickListener(v -> {
             List<SleepingApp> selected = selectedOutdated();
@@ -101,10 +104,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
             if (svc == null) {
                 // Batch mode is fully automated (auto-clicking Play Store's buttons, the
                 // touch-blocking shade) and that requires the accessibility service.
-                Toast.makeText(this,
-                        "Enable \"DeepWake\" in Accessibility settings to allow automatic batch updates",
-                        Toast.LENGTH_LONG).show();
-                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                showAccessibilityHelpDialog();
                 return;
             }
             if (svc.isRunning()) {
@@ -113,6 +113,75 @@ public class MainActivity extends Activity implements ScanService.Listener {
             }
             svc.startBatchUpdate(selected);
         });
+
+        maybeShowBatchReport(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        maybeShowBatchReport(intent);
+    }
+
+    /**
+     * AutoUpdateService relaunches this activity with a result summary when a batch run
+     * finishes; show it as a report dialog. The extras are cleared afterwards so a config
+     * change / recreation doesn't replay the same report.
+     */
+    private void maybeShowBatchReport(Intent intent) {
+        if (intent == null || !intent.hasExtra(AutoUpdateService.EXTRA_REPORT_UPDATED)) return;
+        ArrayList<String> updated = intent.getStringArrayListExtra(AutoUpdateService.EXTRA_REPORT_UPDATED);
+        ArrayList<String> notUpdated = intent.getStringArrayListExtra(AutoUpdateService.EXTRA_REPORT_NOT_UPDATED);
+        intent.removeExtra(AutoUpdateService.EXTRA_REPORT_UPDATED);
+        intent.removeExtra(AutoUpdateService.EXTRA_REPORT_NOT_UPDATED);
+
+        StringBuilder sb = new StringBuilder();
+        if (updated != null && !updated.isEmpty()) {
+            sb.append("Updated (").append(updated.size()).append("):\n");
+            for (String name : updated) sb.append("  ✓ ").append(name).append("\n");
+        } else {
+            sb.append("No apps were updated.\n");
+        }
+        if (notUpdated != null && !notUpdated.isEmpty()) {
+            sb.append("\nNot updated (").append(notUpdated.size()).append("):\n");
+            for (String name : notUpdated) sb.append("  ✗ ").append(name).append("\n");
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Batch update report")
+                .setMessage(sb.toString().trim())
+                .setPositiveButton("OK", null)
+                .show();
+
+        // The batch removed updated apps from storage while we were unbound - refresh.
+        reloadFromStorage();
+    }
+
+    /**
+     * On Android 13+ a sideloaded app's accessibility toggle is blocked behind
+     * "Restricted settings" (the "allow restricted apps" prompt the toggle shows), so plain
+     * "go flip the switch" instructions dead-end. Walk the user through the unblock too.
+     */
+    private void showAccessibilityHelpDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("Enable the DeepWake service")
+                .setMessage("Automatic batch updates need DeepWake's accessibility service.\n\n"
+                        + "1. Open Accessibility settings\n"
+                        + "2. Find DeepWake and turn it on\n\n"
+                        + "If the toggle is blocked with a \"Restricted setting\" message "
+                        + "(normal for apps installed outside an app store on Android 13+):\n\n"
+                        + "1. Tap App info below\n"
+                        + "2. Tap the ⋮ menu (top right)\n"
+                        + "3. Tap \"Allow restricted settings\"\n"
+                        + "4. Come back and enable the service")
+                .setPositiveButton("Accessibility settings", (d, w) ->
+                        startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)))
+                .setNeutralButton("App info", (d, w) ->
+                        startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:" + getPackageName()))))
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     @Override
@@ -172,6 +241,13 @@ public class MainActivity extends Activity implements ScanService.Listener {
         int outdated = 0;
         for (SleepingApp a : appList) if (isOutdated(a)) outdated++;
         statusText.setText(outdated + " outdated / " + trackedPackages.size() + " sleeping tracked");
+        updateSelectionCount();
+    }
+
+    /** Keeps the Update button showing how many apps are currently ticked. */
+    private void updateSelectionCount() {
+        int count = selectedOutdated().size();
+        btnUpdateAll.setText(count > 0 ? "Update Selected (" + count + ")" : "Update Selected");
     }
 
     private void setScanning(boolean scanning) {

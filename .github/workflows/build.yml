@@ -31,10 +31,33 @@ jobs:
           VERSION_NAME=$(./gradlew -q :app:printVersionName)
           echo "tag=v${VERSION_NAME}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
+      # Decode the persistent signing keystore from the repo secret. If the secrets are
+      # not configured the build silently falls back to per-runner debug signing - which
+      # means each APK gets a different signature and can't install over the previous
+      # one, so keep the secrets populated.
+      - name: Set up signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.DEEPWAKE_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/deepwake.keystore"
+            echo "DEEPWAKE_KEYSTORE_FILE=$RUNNER_TEMP/deepwake.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::DEEPWAKE_KEYSTORE_B64 secret not set - APKs will be signed with a throwaway debug key"
+          fi
+
       - name: Build debug APK
+        env:
+          DEEPWAKE_KEYSTORE_PASSWORD: ${{ secrets.DEEPWAKE_KEYSTORE_PASSWORD }}
+          DEEPWAKE_KEY_ALIAS: ${{ secrets.DEEPWAKE_KEY_ALIAS }}
+          DEEPWAKE_KEY_PASSWORD: ${{ secrets.DEEPWAKE_KEY_PASSWORD }}
         run: ./gradlew assembleDebug
 
-      - name: Build release APK (unsigned)
+      - name: Build release APK
+        env:
+          DEEPWAKE_KEYSTORE_PASSWORD: ${{ secrets.DEEPWAKE_KEYSTORE_PASSWORD }}
+          DEEPWAKE_KEY_ALIAS: ${{ secrets.DEEPWAKE_KEY_ALIAS }}
+          DEEPWAKE_KEY_PASSWORD: ${{ secrets.DEEPWAKE_KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
       - name: Rename APKs with version
@@ -42,8 +65,14 @@ jobs:
           mkdir -p release-assets
           cp app/build/outputs/apk/debug/app-debug.apk \
             "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk"
-          cp app/build/outputs/apk/release/app-release-unsigned.apk \
-            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk"
+          # Signed builds emit app-release.apk; unsigned fall back to app-release-unsigned.apk.
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk \
+              "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
+          else
+            cp app/build/outputs/apk/release/app-release-unsigned.apk \
+              "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
+          fi
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
@@ -54,8 +83,8 @@ jobs:
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-unsigned
-          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk
+          name: app-release
+          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk
 
       - name: Delete previous releases and tags
         if: github.event_name == 'push'
@@ -85,7 +114,7 @@ jobs:
           name: ${{ steps.ver.outputs.tag }}
           files: |
             release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk
-            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release-unsigned.apk
+            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

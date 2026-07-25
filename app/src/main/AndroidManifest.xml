@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Lets the batch flow kill a stuck Play Store (stale "All apps up to date" cache)
+         so reopening it forces a cold reload of the updates list. Normal-level permission,
+         granted at install. -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
 
     <application
         android:icon="@mipmap/ic_launcher"

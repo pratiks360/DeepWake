@@ -1,6 +1,7 @@
 package com.pratiks360.deepwake;
 
 import android.accessibilityservice.AccessibilityService;
+import android.app.ActivityManager;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -65,9 +66,15 @@ public class AutoUpdateService extends AccessibilityService {
                                                       // (Play Store installs one app at a
                                                       // time, so a big app can hold progress)
     private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
+    private static final int RESTART_PS_TICKS = 9;    // ~45s zero progress with everything
+                                                      // awake -> kill + reopen Play Store
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
+
+    // Extras on the MainActivity relaunch intent carrying the finished run's report.
+    public static final String EXTRA_REPORT_UPDATED = "com.pratiks360.deepwake.REPORT_UPDATED";
+    public static final String EXTRA_REPORT_NOT_UPDATED = "com.pratiks360.deepwake.REPORT_NOT_UPDATED";
 
     // Accessibility services are singletons managed by the system; this is the standard
     // way for the rest of the app to reach the live instance (null = not enabled).
@@ -88,6 +95,8 @@ public class AutoUpdateService extends AccessibilityService {
     // below operates on pending only - the queue feeds it one batch at a time.
     private final List<SleepingApp> queue = new ArrayList<>();
     private final List<SleepingApp> pending = new ArrayList<>();
+    private final ArrayList<String> updatedNames = new ArrayList<>();
+    private final ArrayList<String> skippedNames = new ArrayList<>();
     private int totalSelected;
     private int totalBatches;
     private int batchNumber;      // 1-based, for the overlay status
@@ -148,6 +157,8 @@ public class AutoUpdateService extends AccessibilityService {
         updatedCount = 0;
         skippedCount = 0;
         batchNumber = 0;
+        updatedNames.clear();
+        skippedNames.clear();
         queue.clear();
         queue.addAll(apps);
         totalSelected = queue.size();
@@ -227,12 +238,50 @@ public class AutoUpdateService extends AccessibilityService {
         boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake();
         if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
             skippedCount += pending.size();
+            for (SleepingApp app : pending) skippedNames.add(app.appName);
             startNextBatch();
             return;
         }
 
-        maybeRewake(tick);
+        if (shouldRestartPlayStore(tick)) {
+            restartPlayStore();
+        } else {
+            maybeRewake(tick);
+        }
         handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
+    }
+
+    /**
+     * Play Store's Overview page can get stuck on a stale "All apps up to date" while an
+     * awake app still has an update pending (its cache never re-lists the app). Re-wake
+     * can't help there - the apps ARE awake - so after every ~RESTART_PS_TICKS of zero
+     * progress with everything awake, kill Play Store's process and reopen it, forcing a
+     * cold reload of the updates list.
+     */
+    private boolean shouldRestartPlayStore(int tick) {
+        int idle = tick - lastProgressTick;
+        return idle >= RESTART_PS_TICKS && idle % RESTART_PS_TICKS == 0 && allAwake();
+    }
+
+    private void restartPlayStore() {
+        disarmAutoClick();
+        setOverlayStatus(batchLabel() + "Play Store looks stuck - restarting it...");
+        // Play Store is foreground (under our overlay); killBackgroundProcesses only kills
+        // background processes, so shove it to the background with HOME first.
+        performGlobalAction(GLOBAL_ACTION_HOME);
+        handler.postDelayed(() -> {
+            if (!running) return;
+            try {
+                ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                am.killBackgroundProcesses(PLAY_STORE_PKG);
+            } catch (Exception e) {
+                // Even if the kill is denied/no-op, reopening still re-focuses the page and
+                // the pull-to-refresh in the rewake path can catch it on a later tick.
+                Log.w(TAG, "killBackgroundProcesses failed: " + e.getMessage());
+            }
+            openPlayStoreUpdates();
+            armAutoClick();
+        }, 800);
     }
 
     private String batchLabel() {
@@ -338,18 +387,25 @@ public class AutoUpdateService extends AccessibilityService {
     private void finishFlow() {
         // Normal finish happens with pending/queue empty, but a mid-run stop can leave both
         // populated - everything not updated counts as still pending.
-        int pend = skippedCount + pending.size() + queue.size();
+        ArrayList<String> notUpdated = new ArrayList<>(skippedNames);
+        for (SleepingApp app : pending) notUpdated.add(app.appName);
+        for (SleepingApp app : queue) notUpdated.add(app.appName);
+        int pend = notUpdated.size();
         stopFlowInternal();
         Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
                 + (pend > 0 ? ", " + pend + " still pending" : ""),
                 Toast.LENGTH_LONG).show();
-        bringDeepWakeToFront();
+        // Hand the report to MainActivity, which shows it as a dialog.
+        Intent report = new Intent(this, MainActivity.class);
+        report.putStringArrayListExtra(EXTRA_REPORT_UPDATED, new ArrayList<>(updatedNames));
+        report.putStringArrayListExtra(EXTRA_REPORT_NOT_UPDATED, notUpdated);
+        bringDeepWakeToFront(report);
     }
 
     private void cancelFlow(boolean returnToApp) {
         if (!running && overlay == null) return;
         stopFlowInternal();
-        if (returnToApp) bringDeepWakeToFront();
+        if (returnToApp) bringDeepWakeToFront(new Intent(this, MainActivity.class));
     }
 
     private void stopFlowInternal() {
@@ -373,6 +429,7 @@ public class AutoUpdateService extends AccessibilityService {
 
     private void markUpdated(SleepingApp app) {
         updatedCount++;
+        updatedNames.add(app.appName);
         List<SleepingApp> all = AppListStorage.load(this);
         all.removeIf(a -> a.packageName.equals(app.packageName));
         AppListStorage.save(this, all);
@@ -430,8 +487,7 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
-    private void bringDeepWakeToFront() {
-        Intent i = new Intent(this, MainActivity.class);
+    private void bringDeepWakeToFront(Intent i) {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                 | Intent.FLAG_ACTIVITY_CLEAR_TOP
                 | Intent.FLAG_ACTIVITY_SINGLE_TOP);
