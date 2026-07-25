@@ -69,6 +69,10 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
+    // Extras on the MainActivity relaunch intent carrying the finished run's report.
+    public static final String EXTRA_REPORT_UPDATED = "com.pratiks360.deepwake.REPORT_UPDATED";
+    public static final String EXTRA_REPORT_NOT_UPDATED = "com.pratiks360.deepwake.REPORT_NOT_UPDATED";
+
     // Accessibility services are singletons managed by the system; this is the standard
     // way for the rest of the app to reach the live instance (null = not enabled).
     private static AutoUpdateService instance;
@@ -88,6 +92,8 @@ public class AutoUpdateService extends AccessibilityService {
     // below operates on pending only - the queue feeds it one batch at a time.
     private final List<SleepingApp> queue = new ArrayList<>();
     private final List<SleepingApp> pending = new ArrayList<>();
+    private final ArrayList<String> updatedNames = new ArrayList<>();
+    private final ArrayList<String> skippedNames = new ArrayList<>();
     private int totalSelected;
     private int totalBatches;
     private int batchNumber;      // 1-based, for the overlay status
@@ -148,6 +154,8 @@ public class AutoUpdateService extends AccessibilityService {
         updatedCount = 0;
         skippedCount = 0;
         batchNumber = 0;
+        updatedNames.clear();
+        skippedNames.clear();
         queue.clear();
         queue.addAll(apps);
         totalSelected = queue.size();
@@ -227,6 +235,7 @@ public class AutoUpdateService extends AccessibilityService {
         boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake();
         if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
             skippedCount += pending.size();
+            for (SleepingApp app : pending) skippedNames.add(app.appName);
             startNextBatch();
             return;
         }
@@ -338,18 +347,25 @@ public class AutoUpdateService extends AccessibilityService {
     private void finishFlow() {
         // Normal finish happens with pending/queue empty, but a mid-run stop can leave both
         // populated - everything not updated counts as still pending.
-        int pend = skippedCount + pending.size() + queue.size();
+        ArrayList<String> notUpdated = new ArrayList<>(skippedNames);
+        for (SleepingApp app : pending) notUpdated.add(app.appName);
+        for (SleepingApp app : queue) notUpdated.add(app.appName);
+        int pend = notUpdated.size();
         stopFlowInternal();
         Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
                 + (pend > 0 ? ", " + pend + " still pending" : ""),
                 Toast.LENGTH_LONG).show();
-        bringDeepWakeToFront();
+        // Hand the report to MainActivity, which shows it as a dialog.
+        Intent report = new Intent(this, MainActivity.class);
+        report.putStringArrayListExtra(EXTRA_REPORT_UPDATED, new ArrayList<>(updatedNames));
+        report.putStringArrayListExtra(EXTRA_REPORT_NOT_UPDATED, notUpdated);
+        bringDeepWakeToFront(report);
     }
 
     private void cancelFlow(boolean returnToApp) {
         if (!running && overlay == null) return;
         stopFlowInternal();
-        if (returnToApp) bringDeepWakeToFront();
+        if (returnToApp) bringDeepWakeToFront(new Intent(this, MainActivity.class));
     }
 
     private void stopFlowInternal() {
@@ -373,6 +389,7 @@ public class AutoUpdateService extends AccessibilityService {
 
     private void markUpdated(SleepingApp app) {
         updatedCount++;
+        updatedNames.add(app.appName);
         List<SleepingApp> all = AppListStorage.load(this);
         all.removeIf(a -> a.packageName.equals(app.packageName));
         AppListStorage.save(this, all);
@@ -430,8 +447,7 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
-    private void bringDeepWakeToFront() {
-        Intent i = new Intent(this, MainActivity.class);
+    private void bringDeepWakeToFront(Intent i) {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                 | Intent.FLAG_ACTIVITY_CLEAR_TOP
                 | Intent.FLAG_ACTIVITY_SINGLE_TOP);

@@ -10,14 +10,36 @@ android {
         applicationId "com.pratiks360.deepwake"
         minSdk 26
         targetSdk 33
-        versionCode 5
+        versionCode 6
         versionName "0.${versionCode}"
+    }
+
+    // A persistent signing key, fed via env vars (locally or from GitHub secrets in CI).
+    // Without this every CI runner generates its own throwaway debug keystore, so each
+    // downloaded APK has a different signature and Android refuses to install it over the
+    // previous one ("App not updated") - forcing an uninstall/reinstall every time.
+    def ksFile = System.getenv("DEEPWAKE_KEYSTORE_FILE")
+    signingConfigs {
+        deepwake {
+            if (ksFile != null) {
+                storeFile file(ksFile)
+                storePassword System.getenv("DEEPWAKE_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("DEEPWAKE_KEY_ALIAS")
+                keyPassword System.getenv("DEEPWAKE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (ksFile != null) signingConfig signingConfigs.deepwake
+        }
+        debug {
+            // Debug builds get the same key so a debug APK from one CI run installs
+            // cleanly over the one from the previous run.
+            if (ksFile != null) signingConfig signingConfigs.deepwake
         }
     }
     compileOptions {

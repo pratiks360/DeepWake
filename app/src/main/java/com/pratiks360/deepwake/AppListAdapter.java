@@ -21,10 +21,13 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
 
     private final List<SleepingApp> items;
     private final OnUpdateClickListener listener;
+    private final Runnable onSelectionChanged;
 
-    public AppListAdapter(List<SleepingApp> items, OnUpdateClickListener listener) {
+    public AppListAdapter(List<SleepingApp> items, OnUpdateClickListener listener,
+                          Runnable onSelectionChanged) {
         this.items = items;
         this.listener = listener;
+        this.onSelectionChanged = onSelectionChanged;
     }
 
     @NonNull
@@ -71,7 +74,10 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         // a row would clobber the selection state of whichever app previously used it.
         holder.cbSelect.setOnCheckedChangeListener(null);
         holder.cbSelect.setChecked(app.selected);
-        holder.cbSelect.setOnCheckedChangeListener((btn, checked) -> app.selected = checked);
+        holder.cbSelect.setOnCheckedChangeListener((btn, checked) -> {
+            app.selected = checked;
+            if (onSelectionChanged != null) onSelectionChanged.run();
+        });
 
         // Tapping anywhere on the row toggles selection (the Update button has its own
         // click handler and swallows the touch, so it won't also flip the checkbox).

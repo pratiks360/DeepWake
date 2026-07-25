@@ -1,3 +1,8 @@
+# Signing keystore + passwords - must never be committed
+/signing/
+*.keystore
+*.jks
+
 ##Standard Android Studio ignores
 
 *.iml
