@@ -1,6 +1,7 @@
 package com.pratiks360.deepwake;
 
 import android.accessibilityservice.AccessibilityService;
+import android.app.ActivityManager;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -65,6 +66,8 @@ public class AutoUpdateService extends AccessibilityService {
                                                       // (Play Store installs one app at a
                                                       // time, so a big app can hold progress)
     private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
+    private static final int RESTART_PS_TICKS = 9;    // ~45s zero progress with everything
+                                                      // awake -> kill + reopen Play Store
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final String PLAY_STORE_PKG = "com.android.vending";
@@ -240,8 +243,45 @@ public class AutoUpdateService extends AccessibilityService {
             return;
         }
 
-        maybeRewake(tick);
+        if (shouldRestartPlayStore(tick)) {
+            restartPlayStore();
+        } else {
+            maybeRewake(tick);
+        }
         handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
+    }
+
+    /**
+     * Play Store's Overview page can get stuck on a stale "All apps up to date" while an
+     * awake app still has an update pending (its cache never re-lists the app). Re-wake
+     * can't help there - the apps ARE awake - so after every ~RESTART_PS_TICKS of zero
+     * progress with everything awake, kill Play Store's process and reopen it, forcing a
+     * cold reload of the updates list.
+     */
+    private boolean shouldRestartPlayStore(int tick) {
+        int idle = tick - lastProgressTick;
+        return idle >= RESTART_PS_TICKS && idle % RESTART_PS_TICKS == 0 && allAwake();
+    }
+
+    private void restartPlayStore() {
+        disarmAutoClick();
+        setOverlayStatus(batchLabel() + "Play Store looks stuck - restarting it...");
+        // Play Store is foreground (under our overlay); killBackgroundProcesses only kills
+        // background processes, so shove it to the background with HOME first.
+        performGlobalAction(GLOBAL_ACTION_HOME);
+        handler.postDelayed(() -> {
+            if (!running) return;
+            try {
+                ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                am.killBackgroundProcesses(PLAY_STORE_PKG);
+            } catch (Exception e) {
+                // Even if the kill is denied/no-op, reopening still re-focuses the page and
+                // the pull-to-refresh in the rewake path can catch it on a later tick.
+                Log.w(TAG, "killBackgroundProcesses failed: " + e.getMessage());
+            }
+            openPlayStoreUpdates();
+            armAutoClick();
+        }, 800);
     }
 
     private String batchLabel() {
