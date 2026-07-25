@@ -28,14 +28,18 @@ import java.util.List;
  * Fully automated batch updating, SD-Maid style: while a batch run is active this service
  * draws a full-screen tint overlay that swallows all touches (so the user can't disturb
  * the flow - only the overlay's own Cancel button works), then drives the whole loop
- * itself: wake ALL the selected apps, open Play Store's updates page, auto-click its
- * "Update all" button (which queues every pending update at once), then monitor the whole
- * set until each app's installed version actually moves - switching between the woken apps
- * and Play Store as needed. On aggressive-hibernation devices a woken app can slip back to
- * sleep mid-update (Play Store then stalls it), so while waiting we periodically re-wake any
- * pending app that has gone back to sleep and re-tap Update all - see maybeRewake. The run
- * always finishes on its own (all done / no progress for a while / a hard time cap) so the
- * overlay never sits on Play Store forever waiting for the user to cancel.
+ * itself. The selected apps are worked through in sequential batches of BATCH_SIZE: wake
+ * the current batch's apps, open Play Store's updates page, auto-click its "Update all"
+ * button, then monitor that batch until each app's installed version actually moves -
+ * switching between the woken apps and Play Store as needed. Only when the current batch
+ * completes (or stalls) does the next batch of apps get woken; waking 50 apps at once
+ * just thrashes the device and re-hibernation undoes most of them before Play Store gets
+ * there anyway. On aggressive-hibernation devices a woken app can still slip back to sleep
+ * mid-update (Play Store then stalls it), so while waiting we periodically re-wake any
+ * pending app in the current batch that has gone back to sleep and re-tap Update all - see
+ * maybeRewake. A batch that makes no progress for a while (or hits its hard time cap) is
+ * skipped so the run always moves on and finishes on its own - the overlay never sits on
+ * Play Store forever waiting for the user to cancel.
  *
  * Why an AccessibilityService: it is the only sanctioned mechanism that can (a) click
  * buttons inside another app (Play Store) and (b) draw a TYPE_ACCESSIBILITY_OVERLAY that
@@ -52,13 +56,14 @@ public class AutoUpdateService extends AccessibilityService {
 
     private static final String TAG = "DeepWakeAuto";
 
+    private static final int BATCH_SIZE = 4;          // apps woken/updated at a time
     private static final long STAGGER_MS = 700;       // between app launches
     private static final long SETTLE_MS = 800;        // after last launch, before Play Store
     private static final long VERIFY_INTERVAL_MS = 5000;
-    private static final int GLOBAL_MAX_TICKS = 180;  // ~15 min hard cap, then auto-finish
-    private static final int STALL_TICKS = 36;        // ~3 min zero progress -> finish (Play
-                                                      // Store installs one app at a time, so
-                                                      // a big app can hold progress a while)
+    private static final int BATCH_MAX_TICKS = 180;   // ~15 min hard cap PER BATCH, then skip
+    private static final int STALL_TICKS = 36;        // ~3 min zero progress -> skip batch
+                                                      // (Play Store installs one app at a
+                                                      // time, so a big app can hold progress)
     private static final int REWAKE_EVERY_TICKS = 3;  // re-wake re-slept apps ~every 15s
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
@@ -78,12 +83,17 @@ public class AutoUpdateService extends AccessibilityService {
     private LinearLayout overlay;
     private TextView overlayStatus;
 
-    // The whole selected set is treated as one working list - Play Store's "Update all"
-    // queues every pending update at once, so there's no reason to wait on isolated batches.
+    // queue holds the selected apps not yet attempted; pending is the CURRENT batch's
+    // not-yet-updated apps (at most BATCH_SIZE). All the wake/monitor/re-wake machinery
+    // below operates on pending only - the queue feeds it one batch at a time.
+    private final List<SleepingApp> queue = new ArrayList<>();
     private final List<SleepingApp> pending = new ArrayList<>();
     private int totalSelected;
+    private int totalBatches;
+    private int batchNumber;      // 1-based, for the overlay status
     private int updatedCount;
-    private int lastProgressTick; // tick at which updatedCount last increased
+    private int skippedCount;     // apps abandoned when their batch stalled / hit the cap
+    private int lastProgressTick; // tick (within the current batch) of the last update
     private boolean running;
     private boolean autoClickArmed;
     private long lastReopenAttempt;
@@ -136,15 +146,34 @@ public class AutoUpdateService extends AccessibilityService {
         if (running || apps == null || apps.isEmpty()) return;
         running = true;
         updatedCount = 0;
-        lastProgressTick = 0;
-        pending.clear();
-        pending.addAll(apps);
-        totalSelected = pending.size();
+        skippedCount = 0;
+        batchNumber = 0;
+        queue.clear();
+        queue.addAll(apps);
+        totalSelected = queue.size();
+        totalBatches = (totalSelected + BATCH_SIZE - 1) / BATCH_SIZE;
         showOverlay();
+        startNextBatch();
+    }
+
+    /** Pull the next BATCH_SIZE apps off the queue and run them; finish when it's empty. */
+    private void startNextBatch() {
+        if (!running) return;
+        pending.clear();
+        while (pending.size() < BATCH_SIZE && !queue.isEmpty()) {
+            pending.add(queue.remove(0));
+        }
+        if (pending.isEmpty()) {
+            finishFlow();
+            return;
+        }
+        batchNumber++;
+        lastProgressTick = 0;
+        disarmAutoClick(); // no Play Store taps while the new batch's apps are being woken
         handler.post(() -> wakeAll(0));
     }
 
-    /** Wake every selected app (staggered), then hand off to Play Store + the monitor loop. */
+    /** Wake the current batch's apps (staggered), then hand off to Play Store + monitor. */
     private void wakeAll(int i) {
         if (!running) return;
         if (i >= pending.size()) {
@@ -152,21 +181,22 @@ public class AutoUpdateService extends AccessibilityService {
                 if (!running) return;
                 openPlayStoreUpdates();
                 armAutoClick();
-                setOverlayStatus("Waiting for Play Store to update "
+                setOverlayStatus(batchLabel() + "Waiting for Play Store to update "
                         + pending.size() + " app(s)...");
                 handler.postDelayed(() -> monitor(0), VERIFY_INTERVAL_MS);
             }, SETTLE_MS);
             return;
         }
-        setOverlayStatus("Waking apps... (" + (i + 1) + "/" + pending.size() + ")");
+        setOverlayStatus(batchLabel() + "Waking apps... (" + (i + 1) + "/" + pending.size() + ")");
         launchApp(pending.get(i).packageName);
         handler.postDelayed(() -> wakeAll(i + 1), STAGGER_MS);
     }
 
     /**
-     * Single loop over the whole selected set: sweep for completed updates, re-wake any app
-     * that slipped back to sleep, keep Play Store tapping "Update all", and terminate when
-     * everything's done, when there's been no progress for a while, or at the hard cap - so
+     * Loop over the CURRENT batch: sweep for completed updates, re-wake any app that
+     * slipped back to sleep, keep Play Store tapping "Update all". When the batch empties
+     * it rolls straight into the next one; a batch with no progress for a while (or at its
+     * hard cap) is skipped so one stuck app can't wedge the rest of the queue - either way
      * the overlay always dismisses itself instead of sitting on Play Store forever.
      */
     private void monitor(int tick) {
@@ -184,24 +214,29 @@ public class AutoUpdateService extends AccessibilityService {
         }
         if (progressed) lastProgressTick = tick;
 
-        setOverlayStatus(updatedCount + "/" + totalSelected + " updated, "
-                + pending.size() + " remaining...");
+        setOverlayStatus(batchLabel() + updatedCount + "/" + totalSelected + " updated, "
+                + pending.size() + " in this batch...");
 
         if (pending.isEmpty()) {
-            finishFlow();
+            startNextBatch();
             return;
         }
-        // Stop if we've hit the hard cap, or if nothing has updated for a while AND nothing
-        // is still asleep (so re-waking has nothing left to try - Play Store simply has no
-        // more updates to give, e.g. false-positive "outdated" entries).
+        // Skip this batch if it hit its hard cap, or if nothing has updated for a while AND
+        // nothing is still asleep (so re-waking has nothing left to try - Play Store simply
+        // has no more updates to give, e.g. false-positive "outdated" entries).
         boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake();
-        if (tick + 1 >= GLOBAL_MAX_TICKS || stalled) {
-            finishFlow();
+        if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
+            skippedCount += pending.size();
+            startNextBatch();
             return;
         }
 
         maybeRewake(tick);
         handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
+    }
+
+    private String batchLabel() {
+        return totalBatches > 1 ? "Batch " + batchNumber + " of " + totalBatches + "\n" : "";
     }
 
     private void armAutoClick() {
@@ -301,7 +336,9 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void finishFlow() {
-        int pend = pending.size();
+        // Normal finish happens with pending/queue empty, but a mid-run stop can leave both
+        // populated - everything not updated counts as still pending.
+        int pend = skippedCount + pending.size() + queue.size();
         stopFlowInternal();
         Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
                 + (pend > 0 ? ", " + pend + " still pending" : ""),
