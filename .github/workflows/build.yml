@@ -31,20 +31,20 @@ jobs:
           VERSION_NAME=$(./gradlew -q :app:printVersionName)
           echo "tag=v${VERSION_NAME}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-      # Decode the persistent signing keystore from the repo secret. If the secrets are
-      # not configured the build silently falls back to per-runner debug signing - which
-      # means each APK gets a different signature and can't install over the previous
-      # one, so keep the secrets populated.
+      # Decode the persistent signing keystore from the repo secret. A missing secret is a
+      # HARD failure: without it Gradle silently falls back to a per-runner throwaway debug
+      # keystore, and the published APK can never install over the existing app ("App not
+      # updated") - exactly the bug this signing setup exists to prevent.
       - name: Set up signing keystore
         env:
           KEYSTORE_B64: ${{ secrets.DEEPWAKE_KEYSTORE_B64 }}
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/deepwake.keystore"
-            echo "DEEPWAKE_KEYSTORE_FILE=$RUNNER_TEMP/deepwake.keystore" >> "$GITHUB_ENV"
-          else
-            echo "::warning::DEEPWAKE_KEYSTORE_B64 secret not set - APKs will be signed with a throwaway debug key"
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::DEEPWAKE_KEYSTORE_B64 secret not set - refusing to publish a throwaway-signed APK. Run signing/set-secrets.js (see signing/SIGNING-INFO.txt)."
+            exit 1
           fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/deepwake.keystore"
+          echo "DEEPWAKE_KEYSTORE_FILE=$RUNNER_TEMP/deepwake.keystore" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         env:
@@ -60,19 +60,22 @@ jobs:
           DEEPWAKE_KEY_PASSWORD: ${{ secrets.DEEPWAKE_KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
+      # Print each APK's signing certificate so a signature drift between builds is
+      # visible right in the run log (both digests must match every previous run).
+      - name: Verify APK signatures
+        run: |
+          for apk in app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk; do
+            echo "== $apk"
+            keytool -printcert -jarfile "$apk" | grep -E 'Owner:|SHA256:'
+          done
+
       - name: Rename APKs with version
         run: |
           mkdir -p release-assets
           cp app/build/outputs/apk/debug/app-debug.apk \
             "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk"
-          # Signed builds emit app-release.apk; unsigned fall back to app-release-unsigned.apk.
-          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
-            cp app/build/outputs/apk/release/app-release.apk \
-              "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
-          else
-            cp app/build/outputs/apk/release/app-release-unsigned.apk \
-              "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
-          fi
+          cp app/build/outputs/apk/release/app-release.apk \
+            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
