@@ -61,12 +61,15 @@ jobs:
         run: ./gradlew assembleRelease
 
       # Print each APK's signing certificate so a signature drift between builds is
-      # visible right in the run log (both digests must match every previous run).
+      # visible right in the run log (the digests must match every previous run).
+      # keytool -jarfile can't do this: it only reads the legacy v1 (JAR) signature,
+      # and with minSdk >= 24 AGP signs v2+ only - apksigner understands all schemes.
       - name: Verify APK signatures
         run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
           for apk in app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/release/app-release.apk; do
             echo "== $apk"
-            keytool -printcert -jarfile "$apk" | grep -E 'Owner:|SHA256:'
+            "$APKSIGNER" verify --print-certs "$apk"
           done
 
       - name: Rename APKs with version
