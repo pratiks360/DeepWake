@@ -22,8 +22,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Fully automated batch updating, SD-Maid style: while a batch run is active this service
@@ -40,9 +44,12 @@ import java.util.List;
  * there anyway. On aggressive-hibernation devices a woken app can still slip back to sleep
  * mid-update (Play Store then stalls it), so while waiting we periodically re-wake any
  * pending app in the current batch that has gone back to sleep and re-tap Update all - see
- * maybeRewake. A batch that makes no progress for a while (or hits its hard time cap) is
- * skipped so the run always moves on and finishes on its own - the overlay never sits on
- * Play Store forever waiting for the user to cancel.
+ * maybeRewake. Each app also carries a bounded retry budget: an app Play Store never lists
+ * is woken again, then checked directly against its Play Store listing - if nothing newer
+ * exists it was only ever "outdated" by a stale scrape and counts as done, otherwise it gets
+ * one last wake and is reported as failed. A batch that makes no progress for a while (or
+ * hits its hard time cap) is skipped so the run always moves on and finishes on its own -
+ * the overlay never sits on Play Store forever waiting for the user to cancel.
  *
  * Why an AccessibilityService: it is the only sanctioned mechanism that can (a) click
  * buttons inside another app (Play Store) and (b) draw a TYPE_ACCESSIBILITY_OVERLAY that
@@ -75,6 +82,16 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
     private static final long CHECK_COOLDOWN_MS = 9000;  // min gap between "Check for updates" taps
     private static final int EMPTY_DOWNLOADS_TRIGGER = 4; // confirmed-empty polls -> re-wake batch
+    // Per-app retry budget. An app that Play Store never lists is woken again; after
+    // VERIFY_AFTER_ATTEMPTS fruitless wakes we ask Play Store directly what the latest
+    // version is (see resolvePending), and MAX_WAKE_ATTEMPTS is the hard stop after which
+    // the app is reported as failed rather than chased for the rest of the batch.
+    private static final int VERIFY_AFTER_ATTEMPTS = 2;
+    private static final int MAX_WAKE_ATTEMPTS = 3;
+    // ...but never judge an app while the batch is still visibly progressing: Play Store
+    // installs one app at a time, and a batch-wide re-wake cycle bumps every pending app's
+    // attempt count at once, so without this an app could be retired mid-download.
+    private static final int RESOLVE_IDLE_TICKS = 12; // ~60s of no progress in the batch
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
     // Labels used to drive Play Store's UI. The Downloads screen is the only page with a
@@ -112,6 +129,11 @@ public class AutoUpdateService extends AccessibilityService {
     private final List<SleepingApp> pending = new ArrayList<>();
     private final ArrayList<String> updatedNames = new ArrayList<>();
     private final ArrayList<String> skippedNames = new ArrayList<>();
+    // Per-package wake attempts and which packages have already been re-checked against
+    // Play Store, so each app is chased a bounded number of times and verified only once.
+    private final Map<String, Integer> wakeAttempts = new HashMap<>();
+    private final Set<String> verified = new HashSet<>();
+    private final Set<String> verifyInFlight = new HashSet<>();
     private int totalSelected;
     private int totalBatches;
     private int batchNumber;      // 1-based, for the overlay status
@@ -177,6 +199,9 @@ public class AutoUpdateService extends AccessibilityService {
         batchNumber = 0;
         updatedNames.clear();
         skippedNames.clear();
+        wakeAttempts.clear();
+        verified.clear();
+        verifyInFlight.clear();
         queue.clear();
         queue.addAll(apps);
         totalSelected = queue.size();
@@ -230,6 +255,9 @@ public class AutoUpdateService extends AccessibilityService {
      * it rolls straight into the next one; a batch with no progress for a while (or at its
      * hard cap) is skipped so one stuck app can't wedge the rest of the queue - either way
      * the overlay always dismisses itself instead of sitting on Play Store forever.
+     * resolvePending additionally retires individual apps that have burnt their retry
+     * budget, so a single never-listed app is settled on its own terms (verified against
+     * Play Store, then updated-or-failed) rather than dragging the batch to the timeout.
      */
     private void monitor(int tick) {
         if (!running) return;
@@ -246,13 +274,18 @@ public class AutoUpdateService extends AccessibilityService {
         }
         if (progressed) lastProgressTick = tick;
 
-        setOverlayStatus(batchLabel() + updatedCount + "/" + totalSelected + " updated, "
-                + pending.size() + " in this batch...");
+        // Retire apps that have used up their retry budget, so the batch shrinks instead of
+        // one never-listed app holding the whole run to the stall timeout.
+        resolvePending(tick);
 
         if (pending.isEmpty()) {
             startNextBatch();
             return;
         }
+
+        setOverlayStatus(batchLabel() + updatedCount + "/" + totalSelected + " updated, "
+                + pending.size() + " in this batch...");
+
         // Skip this batch if it hit its hard cap, or if nothing has updated for a while AND
         // nothing is still asleep (so re-waking has nothing left to try - Play Store simply
         // has no more updates to give, e.g. false-positive "outdated" entries). Never give
@@ -282,6 +315,84 @@ public class AutoUpdateService extends AccessibilityService {
             maybeRewake(tick);
         }
         handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
+    }
+
+    /**
+     * Enforces the per-app retry budget. When Play Store lists 3 of a batch's 4 apps, the
+     * missing one gets woken again by the normal cycles; this decides when to stop chasing:
+     *
+     *   after VERIFY_AFTER_ATTEMPTS fruitless wakes -> ask Play Store what the latest
+     *       version actually is (async, see verifyAgainstPlayStore). If it isn't newer than
+     *       what's installed, the app was never really outdated - the stale scraped version
+     *       was - so count it as done instead of chasing it forever.
+     *   at MAX_WAKE_ATTEMPTS with a genuinely newer version available -> report it as
+     *       failed and drop it, so the batch moves on.
+     */
+    private void resolvePending(int tick) {
+        if (!running) return;
+        if (tick - lastProgressTick < RESOLVE_IDLE_TICKS) return; // batch still moving
+        List<SleepingApp> toVerify = new ArrayList<>();
+        Iterator<SleepingApp> it = pending.iterator();
+        while (it.hasNext()) {
+            SleepingApp app = it.next();
+            int attempts = attemptsFor(app.packageName);
+            if (attempts < VERIFY_AFTER_ATTEMPTS) continue;
+            if (!verified.contains(app.packageName)) {
+                toVerify.add(app); // resolved on a later tick, once the fetch returns
+                continue;
+            }
+            // Verified: Play Store really does have something newer (or we couldn't tell).
+            // Give it the rest of its budget, then stop.
+            if (attempts >= MAX_WAKE_ATTEMPTS) {
+                markFailed(app);
+                it.remove();
+            }
+        }
+        for (SleepingApp app : toVerify) verifyAgainstPlayStore(app);
+    }
+
+    /**
+     * Re-fetches the app's Play Store version and compares it with what's installed. The
+     * fetch is network I/O, so it runs off the main thread and lands back on the handler.
+     */
+    private void verifyAgainstPlayStore(SleepingApp app) {
+        if (!verifyInFlight.add(app.packageName)) return; // already checking this one
+        setOverlayStatus(batchLabel() + "Checking " + app.appName + " against Play Store...");
+        new Thread(() -> {
+            String installed = getInstalledVersion(app.packageName);
+            String latest = PlayStoreVersionFetcher.fetchLatestVersion(
+                    app.packageName, installed == null ? "" : installed);
+            handler.post(() -> onVerified(app, installed, latest));
+        }).start();
+    }
+
+    private void onVerified(SleepingApp app, String installed, String latest) {
+        verifyInFlight.remove(app.packageName);
+        if (!running) return;
+        verified.add(app.packageName);
+
+        boolean usable = latest != null && !latest.isEmpty()
+                && !latest.equals(PlayStoreVersionFetcher.NET_ERROR)
+                && !latest.equals(PlayStoreVersionFetcher.NO_MATCH);
+        if (!usable) return; // can't tell - the retry budget still applies
+
+        app.latestVersion = latest; // keep the fresh value for isUpdated / the app list
+        if (installed != null && !installed.isEmpty()
+                && !PlayStoreVersionFetcher.isNewerVersion(latest, installed)) {
+            // Nothing newer exists: the installed build IS the current one, so the app was
+            // only ever "outdated" because of a stale scrape. Retire it as done.
+            if (pending.remove(app)) markAlreadyCurrent(app);
+        }
+    }
+
+    private int attemptsFor(String packageName) {
+        Integer n = wakeAttempts.get(packageName);
+        return n == null ? 0 : n;
+    }
+
+    private void markFailed(SleepingApp app) {
+        skippedCount++;
+        skippedNames.add(app.appName);
     }
 
     /**
@@ -506,6 +617,22 @@ public class AutoUpdateService extends AccessibilityService {
     private void markUpdated(SleepingApp app) {
         updatedCount++;
         updatedNames.add(app.appName);
+        forget(app);
+    }
+
+    /**
+     * The app turned out to already be on Play Store's latest version - it only looked
+     * outdated because the stored "latest" came from an earlier, stale scrape. Counted with
+     * the updated apps (nothing is left to do for it) but labelled so the report is honest.
+     */
+    private void markAlreadyCurrent(SleepingApp app) {
+        updatedCount++;
+        updatedNames.add(app.appName + " (already up to date)");
+        forget(app);
+    }
+
+    /** Drop the app from the tracked list - it no longer needs updating. */
+    private void forget(SleepingApp app) {
         List<SleepingApp> all = AppListStorage.load(this);
         all.removeIf(a -> a.packageName.equals(app.packageName));
         AppListStorage.save(this, all);
@@ -522,7 +649,14 @@ public class AutoUpdateService extends AccessibilityService {
 
     // ---------------------------------------------------------------- activity starts
 
+    /**
+     * Wakes an app by launching it. Every call counts against that package's retry budget -
+     * this is the only path that wakes apps (Play Store goes through tryStart), so counting
+     * here catches the initial wake, the batch-wide re-wake cycles and the re-slept re-wakes
+     * alike. resolvePending acts on the count.
+     */
     private void launchApp(String packageName) {
+        wakeAttempts.put(packageName, attemptsFor(packageName) + 1);
         PackageManager pm = getPackageManager();
         Intent intent = pm.getLaunchIntentForPackage(packageName);
         if (intent != null) {
