@@ -30,8 +30,10 @@ import java.util.List;
  * draws a full-screen tint overlay that swallows all touches (so the user can't disturb
  * the flow - only the overlay's own Cancel button works), then drives the whole loop
  * itself. The selected apps are worked through in sequential batches of BATCH_SIZE: wake
- * the current batch's apps, open Play Store's updates page, auto-click its "Update all"
- * button, then monitor that batch until each app's installed version actually moves -
+ * the current batch's apps, drive Play Store to its DOWNLOADS screen (the deep link lands
+ * on the Overview tab of "Manage apps and device", which is one click short of it), tap
+ * "Check for updates" when nothing is listed, auto-click "Update all", then monitor that
+ * batch until each app's installed version actually moves -
  * switching between the woken apps and Play Store as needed. Only when the current batch
  * completes (or stalls) does the next batch of apps get woken; waking 50 apps at once
  * just thrashes the device and re-hibernation undoes most of them before Play Store gets
@@ -71,7 +73,19 @@ public class AutoUpdateService extends AccessibilityService {
     private static final long REOPEN_COOLDOWN_MS = 2500; // min gap between re-opening Play Store
     private static final long REOPEN_SETTLED_COOLDOWN_MS = 12000; // ...while Play Store is front
     private static final long POLL_INTERVAL_MS = 1200;   // retry the click even without events
+    private static final long CHECK_COOLDOWN_MS = 9000;  // min gap between "Check for updates" taps
+    private static final int EMPTY_DOWNLOADS_TRIGGER = 4; // confirmed-empty polls -> re-wake batch
     private static final String PLAY_STORE_PKG = "com.android.vending";
+
+    // Labels used to drive Play Store's UI. The Downloads screen is the only page with a
+    // real "Update all"; the Overview page of "Manage apps and device" carries a row that
+    // navigates INTO Downloads, which is where the deep link tends to land instead.
+    private static final String[] UPDATE_LABELS = {"Update all", "Update"};
+    private static final String CHECK_LABEL = "Check for updates";
+    private static final String[] DOWNLOADS_MARKERS =
+            {"Downloads", CHECK_LABEL, "Update all", "You're ready"};
+    private static final String[] DOWNLOADS_ENTRY_LABELS =
+            {"Updates available", "All apps up to date", "See details"};
 
     // Extras on the MainActivity relaunch intent carrying the finished run's report.
     public static final String EXTRA_REPORT_UPDATED = "com.pratiks360.deepwake.REPORT_UPDATED";
@@ -107,6 +121,9 @@ public class AutoUpdateService extends AccessibilityService {
     private boolean running;
     private boolean autoClickArmed;
     private long lastReopenAttempt;
+    private long lastCheckClick;     // last "Check for updates" tap, for its cooldown
+    private int emptyDownloadsStreak; // polls seeing an empty Downloads AFTER a completed check
+    private int wakeCyclesThisBatch;  // wake-all + re-check rounds run for the current batch
 
     // While armed, keep retrying on a timer - Play Store's "Update all" button appears only
     // after the page finishes loading over the network, and relying solely on accessibility
@@ -181,6 +198,9 @@ public class AutoUpdateService extends AccessibilityService {
         }
         batchNumber++;
         lastProgressTick = 0;
+        emptyDownloadsStreak = 0;
+        wakeCyclesThisBatch = 0;
+        lastCheckClick = 0;   // the new batch may need an immediate re-check
         disarmAutoClick(); // no Play Store taps while the new batch's apps are being woken
         handler.post(() -> wakeAll(0));
     }
@@ -191,7 +211,7 @@ public class AutoUpdateService extends AccessibilityService {
         if (i >= pending.size()) {
             handler.postDelayed(() -> {
                 if (!running) return;
-                openPlayStoreUpdates();
+                openPlayStoreDownloads();
                 armAutoClick();
                 setOverlayStatus(batchLabel() + "Waiting for Play Store to update "
                         + pending.size() + " app(s)...");
@@ -235,8 +255,12 @@ public class AutoUpdateService extends AccessibilityService {
         }
         // Skip this batch if it hit its hard cap, or if nothing has updated for a while AND
         // nothing is still asleep (so re-waking has nothing left to try - Play Store simply
-        // has no more updates to give, e.g. false-positive "outdated" entries).
-        boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake();
+        // has no more updates to give, e.g. false-positive "outdated" entries). Never give
+        // up before at least one full wake-all + re-check cycle has run, though: that cycle
+        // is the only thing that makes a re-slept app visible to Play Store's check, and
+        // abandoning the batch first is what left apps behind as "Not updated".
+        boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake()
+                && wakeCyclesThisBatch > 0;
         if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
             skippedCount += pending.size();
             for (SleepingApp app : pending) skippedNames.add(app.appName);
@@ -246,6 +270,14 @@ public class AutoUpdateService extends AccessibilityService {
 
         if (shouldRestartPlayStore(tick)) {
             restartPlayStore();
+        } else if (emptyDownloadsStreak >= EMPTY_DOWNLOADS_TRIGGER) {
+            // Play Store checked and genuinely listed nothing. A sleeping app is invisible
+            // to that check, so wake the whole batch and drive it back to Downloads for a
+            // fresh check with the apps actually awake.
+            emptyDownloadsStreak = 0;
+            setOverlayStatus(batchLabel() + "No updates listed - re-waking "
+                    + pending.size() + " app(s)...");
+            wakePendingThenReturnToDownloads();
         } else {
             maybeRewake(tick);
         }
@@ -286,25 +318,39 @@ public class AutoUpdateService extends AccessibilityService {
             // if it's asleep when the fresh page loads, Play Store truthfully reports
             // "All apps up to date" and the batch wedges on that screen. Launching an
             // already-awake app costs only a brief flash, so wake them all unconditionally.
-            rewakePendingThenReopen(0);
+            wakePendingThenReturnToDownloads();
         }, 800);
     }
 
-    private void rewakePendingThenReopen(int i) {
+    /**
+     * Wake every app still pending in this batch, then drive back to Play Store's Downloads
+     * screen and force a fresh check. Play Store only lists an app as updatable while that
+     * app is awake, so the check has to run with the whole batch awake - waking them first
+     * and re-checking after is the sequence that actually surfaces them.
+     */
+    private void wakePendingThenReturnToDownloads() {
+        disarmAutoClick(); // no Play Store taps while we flip through the apps
+        wakeCyclesThisBatch++;
+        wakePendingStep(0);
+    }
+
+    private void wakePendingStep(int i) {
         if (!running) return;
         if (i >= pending.size()) {
             handler.postDelayed(() -> {
                 if (!running) return;
-                openPlayStoreUpdates();
-                // A cold start can still render the updates list from cache; nudge an
-                // explicit re-check once the page has had a moment to load.
+                openPlayStoreDownloads();
+                // Let the page settle, then force the re-check; the poll takes over from
+                // there and taps "Update all" as soon as the list populates.
+                lastCheckClick = 0;
+                emptyDownloadsStreak = 0;
                 handler.postDelayed(this::refreshPlayStore, 2500);
                 armAutoClick();
             }, SETTLE_MS);
             return;
         }
         launchApp(pending.get(i).packageName);
-        handler.postDelayed(() -> rewakePendingThenReopen(i + 1), STAGGER_MS);
+        handler.postDelayed(() -> wakePendingStep(i + 1), STAGGER_MS);
     }
 
     private String batchLabel() {
@@ -347,7 +393,8 @@ public class AutoUpdateService extends AccessibilityService {
             // All re-woken - return to Play Store, force it to RE-CHECK for updates so the
             // apps that slept (and dropped off the cached "Available updates" list) show up
             // again, then re-tap Update all.
-            openPlayStoreUpdates();
+            openPlayStoreDownloads();
+            lastCheckClick = 0;
             handler.postDelayed(this::refreshPlayStore, 1500); // let Downloads load first
             armAutoClick();
             return;
@@ -360,22 +407,28 @@ public class AutoUpdateService extends AccessibilityService {
      * Forces Play Store to re-scan for updates. When a woken app falls back asleep mid-run
      * Play Store drops it from the cached Downloads list and won't re-add it on its own;
      * re-launching the app un-sleeps it but Play Store still needs a refresh to notice.
-     * Tries a "Check for updates" control if the build has one, else pull-to-refresh
-     * (scroll the list up), which triggers the SwipeRefresh on the Downloads screen.
+     * Taps the Downloads screen's "Check for updates" button, falling back to
+     * pull-to-refresh (scroll the list up) on builds that don't show one.
      */
     private void refreshPlayStore() {
         if (!running) return;
-        List<AccessibilityWindowInfo> windows = getWindows();
-        if (windows == null) return;
-        for (AccessibilityWindowInfo w : windows) {
-            AccessibilityNodeInfo root = w.getRoot();
-            if (root == null) continue;
-            CharSequence pkg = root.getPackageName();
-            if (pkg == null || !PLAY_STORE_PKG.contentEquals(pkg)) continue;
-            if (clickByLabelDfs(root, "Check for updates", 0)) return;
-            scrollRefresh(root, 0); // pull-to-refresh fallback
+        AccessibilityNodeInfo root = findPlayStoreRoot();
+        if (root == null) return;
+        if (!onDownloadsPage(root)) {
+            // Still on the Overview page - step into Downloads and re-check shortly after.
+            for (String entry : DOWNLOADS_ENTRY_LABELS) {
+                if (clickByLabelDfs(root, entry, 0)) {
+                    handler.postDelayed(this::refreshPlayStore, 1500);
+                    return;
+                }
+            }
             return;
         }
+        if (clickByLabelDfs(root, CHECK_LABEL, 0)) {
+            lastCheckClick = System.currentTimeMillis();
+            return;
+        }
+        scrollRefresh(root, 0); // pull-to-refresh fallback
     }
 
     private boolean scrollRefresh(AccessibilityNodeInfo node, int depth) {
@@ -482,9 +535,13 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
-    private void openPlayStoreUpdates() {
-        // Package pinned so this internal action resolves reliably and lands on the
-        // "Downloads / Manage updates" screen (where the "Update all" button lives).
+    /**
+     * Brings up Play Store's updates UI. On current builds this deep link lands on the
+     * OVERVIEW tab of "Manage apps and device", not the Downloads screen with "Update all" -
+     * driveToPlayStoreAndClick finishes the journey by clicking through to Downloads.
+     */
+    private void openPlayStoreDownloads() {
+        // Package pinned so this internal action resolves reliably.
         Intent deepLink = new Intent("com.google.android.finsky.VIEW_MY_DOWNLOADS")
                 .setPackage(PLAY_STORE_PKG)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -526,72 +583,112 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     /**
-     * The heart of the batch loop's reliability. Every tick (poll + accessibility event):
-     *   1. Try to tap "Update all"/"Update" in Play Store's window. ACTION_CLICK is a
+     * The heart of the batch loop's reliability - a small state machine run on every tick
+     * (poll + accessibility event), which always works toward the same place: Play Store's
+     * DOWNLOADS screen with "Update all" tapped.
+     *   1. Play Store not on screen (a just-woken app still covers it) -> reopen it.
+     *   2. On some OTHER Play Store page - the deep link usually lands on the Overview tab
+     *      of "Manage apps and device", which has no real "Update all" - so click the row
+     *      that navigates into Downloads rather than tapping anything there.
+     *   3. On Downloads with updates listed -> tap "Update all". ACTION_CLICK is a
      *      programmatic click on the node, so it works even though our tint overlay sits on
      *      top, AND even if Play Store's window isn't flagged "active" (our overlay can steal
      *      that flag - which is exactly why an isActive()-gated approach never clicked).
-     *      One "Update all" tap triggers every pending update, so we disarm after a hit.
-     *   2. If nothing was tappable (a just-woken app is still on top, or Play Store hasn't
-     *      surfaced yet), re-open Play Store's updates page - rate-limited - so the next tick
-     *      can tap it. Re-opening when Play Store is already front is a harmless re-focus.
+     *      One tap triggers every listed update, so we disarm after a hit.
+     *   4. On Downloads with nothing listed ("You're ready") -> tap "Check for updates" and
+     *      let it finish. If it still lists nothing, count that; once the count trips,
+     *      monitor() re-wakes the whole batch and comes back here (see the empty-Downloads
+     *      handling in monitor) - a sleeping app is invisible to Play Store's check, so the
+     *      apps must be awake at the moment the check runs.
      */
     private void driveToPlayStoreAndClick() {
         if (!running || !autoClickArmed) return;
 
-        if (clickUpdateInPlayStore()) {
-            disarmAutoClick();
+        AccessibilityNodeInfo root = findPlayStoreRoot();
+        if (root == null) {
+            maybeReopen(false);
             return;
         }
 
+        if (!onDownloadsPage(root)) {
+            // Navigate into Downloads from wherever we landed (usually the Overview tab).
+            for (String entry : DOWNLOADS_ENTRY_LABELS) {
+                if (clickByLabelDfs(root, entry, 0)) return;
+            }
+            maybeReopen(true);
+            return;
+        }
+
+        for (String label : UPDATE_LABELS) {
+            if (clickButtonLabeled(root, label)) {
+                emptyDownloadsStreak = 0;
+                disarmAutoClick();
+                return;
+            }
+        }
+
+        // On Downloads, nothing to update. Ask Play Store to re-check - rate-limited, since
+        // re-tapping mid-check just restarts it and the check can never settle.
         long now = System.currentTimeMillis();
-        // Re-firing the deep link restarts the updates page's load from scratch. When Play
-        // Store is already on screen and just slow to list updates, re-opening it every
-        // couple of seconds means the check NEVER completes - the page sits on a spinner
-        // (or a stale "up to date") indefinitely. So while Play Store is front, hold off
-        // much longer; the short cooldown is only for shoving aside a woken app that is
-        // still covering the screen.
-        long cooldown = isPlayStoreShowing() ? REOPEN_SETTLED_COOLDOWN_MS : REOPEN_COOLDOWN_MS;
-        if (now - lastReopenAttempt >= cooldown) {
-            openPlayStoreUpdates();
-            lastReopenAttempt = now;
+        if (now - lastCheckClick >= CHECK_COOLDOWN_MS) {
+            if (clickByLabelDfs(root, CHECK_LABEL, 0)) {
+                lastCheckClick = now;
+                setOverlayStatus(batchLabel() + "Asking Play Store to check for updates...");
+            } else {
+                // Downloads is empty and offers no check button either - nothing more to
+                // try on this screen, so let the re-wake cycle take over.
+                emptyDownloadsStreak++;
+            }
+        } else if (now - lastCheckClick >= CHECK_COOLDOWN_MS / 2) {
+            // The check we asked for has had time to finish and Downloads is still empty -
+            // that is the signal the batch's apps need re-waking before the next check.
+            emptyDownloadsStreak++;
         }
     }
 
-    private boolean isPlayStoreShowing() {
-        List<AccessibilityWindowInfo> windows = getWindows();
-        if (windows == null) return false;
-        for (AccessibilityWindowInfo w : windows) {
-            AccessibilityNodeInfo root = w.getRoot();
-            if (root == null) continue;
-            CharSequence pkg = root.getPackageName();
-            if (pkg != null && PLAY_STORE_PKG.contentEquals(pkg)) return true;
+    /** True when the visible Play Store page is the Downloads screen. */
+    private boolean onDownloadsPage(AccessibilityNodeInfo root) {
+        for (String marker : DOWNLOADS_MARKERS) {
+            if (findByLabelDfs(root, marker, 0) != null) return true;
         }
         return false;
     }
 
-    private boolean clickUpdateInPlayStore() {
-        // Walk every window and act only on Play Store's - getRootInActiveWindow() can hand
-        // back our own overlay window instead, which has no Update button.
+    private void maybeReopen(boolean playStoreShowing) {
+        // Re-firing the deep link restarts the page's load from scratch. When Play Store is
+        // already on screen and just slow, re-opening every couple of seconds means the load
+        // NEVER completes - the page sits on a spinner (or a stale "up to date") forever. So
+        // while Play Store is front, hold off much longer; the short cooldown is only for
+        // shoving aside a woken app that is still covering the screen.
+        long cooldown = playStoreShowing ? REOPEN_SETTLED_COOLDOWN_MS : REOPEN_COOLDOWN_MS;
+        long now = System.currentTimeMillis();
+        if (now - lastReopenAttempt >= cooldown) {
+            openPlayStoreDownloads();
+            lastReopenAttempt = now;
+        }
+    }
+
+    /**
+     * Play Store's root node, or null if it isn't on screen. Walks every window rather than
+     * using getRootInActiveWindow(), which can hand back our own overlay window instead.
+     */
+    private AccessibilityNodeInfo findPlayStoreRoot() {
         List<AccessibilityWindowInfo> windows = getWindows();
         if (windows != null) {
             for (AccessibilityWindowInfo w : windows) {
                 AccessibilityNodeInfo root = w.getRoot();
                 if (root == null) continue;
                 CharSequence pkg = root.getPackageName();
-                if (pkg == null || !PLAY_STORE_PKG.contentEquals(pkg)) continue;
-                if (clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update")) {
-                    return true;
-                }
+                if (pkg != null && PLAY_STORE_PKG.contentEquals(pkg)) return root;
             }
         }
         // Fallback for devices/versions where getWindows() returns nothing usable.
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root != null && root.getPackageName() != null
                 && PLAY_STORE_PKG.contentEquals(root.getPackageName())) {
-            return clickButtonLabeled(root, "Update all") || clickButtonLabeled(root, "Update");
+            return root;
         }
-        return false;
+        return null;
     }
 
     private boolean clickButtonLabeled(AccessibilityNodeInfo root, String label) {
@@ -609,6 +706,17 @@ public class AutoUpdateService extends AccessibilityService {
             if (clickByLabelDfs(node.getChild(i), label, depth + 1)) return true;
         }
         return false;
+    }
+
+    /** Same walk as clickByLabelDfs but read-only - used to identify which page is showing. */
+    private AccessibilityNodeInfo findByLabelDfs(AccessibilityNodeInfo node, String label, int depth) {
+        if (node == null || depth > 40) return null;
+        if (labelMatches(node, label)) return node;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo hit = findByLabelDfs(node.getChild(i), label, depth + 1);
+            if (hit != null) return hit;
+        }
+        return null;
     }
 
     private boolean labelMatches(AccessibilityNodeInfo node, String label) {
