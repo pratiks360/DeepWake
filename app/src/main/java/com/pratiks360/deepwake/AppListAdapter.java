@@ -48,10 +48,14 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         boolean outdated = false;
         boolean enableBtn = false;
 
-        if (latest.equals("checking...")) {
+        if (latest.equals(PlayStoreVersionFetcher.CHECKING)) {
             latestLabel = "Latest: checking...";
         } else if (latest.isEmpty() || latest.equals(PlayStoreVersionFetcher.NO_MATCH)) {
             latestLabel = "Latest: unknown (couldn't read Play Store)";
+        } else if (latest.equals(PlayStoreVersionFetcher.NO_VERSION)) {
+            // Play Store ships this app per-device and publishes no version for it, so
+            // there is nothing to compare against - not a failure on our side.
+            latestLabel = "Latest: varies with device";
         } else if (latest.equals(PlayStoreVersionFetcher.NET_ERROR)) {
             latestLabel = "Latest: unavailable (network)";
         } else {

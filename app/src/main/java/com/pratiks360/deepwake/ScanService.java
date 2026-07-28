@@ -155,8 +155,8 @@ public class ScanService extends Service implements UpdateManager.Listener {
                 // empty on the next open. Keeping the prior value means the list survives.
                 SleepingApp prior = merged.get(info.packageName);
                 String prevLatest = prior != null ? prior.latestVersion : null;
-                String seedLatest = (prevLatest != null && !prevLatest.isEmpty()
-                        && !prevLatest.equals("checking...")) ? prevLatest : "checking...";
+                String seedLatest = PlayStoreVersionFetcher.isUsableVersion(prevLatest)
+                        ? prevLatest : PlayStoreVersionFetcher.CHECKING;
 
                 SleepingApp app = new SleepingApp(info.packageName, appName, current, seedLatest);
                 merged.put(info.packageName, app);
@@ -178,8 +178,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
             for (SleepingApp app : toFetch) {
                 futures.add(fetchPool.submit(() -> {
                     if (!scanning) return;
-                    app.latestVersion =
-                            PlayStoreVersionFetcher.fetchLatestVersion(app.packageName, app.currentVersion);
+                    app.latestVersion = PlayStoreVersionFetcher.fetchLatestVersion(app.packageName);
 
                     // Write just this app's row as its result lands, so a mid-scan process
                     // kill loses at most the fetches still in flight - and two fetch threads

@@ -473,8 +473,7 @@ public class AutoUpdateService extends AccessibilityService {
         setOverlayStatus(batchLabel() + "Checking " + app.appName + " against Play Store...");
         new Thread(() -> {
             String installed = getInstalledVersion(app.packageName);
-            String latest = PlayStoreVersionFetcher.fetchLatestVersion(
-                    app.packageName, installed == null ? "" : installed);
+            String latest = PlayStoreVersionFetcher.fetchLatestVersion(app.packageName);
             handler.post(() -> onVerified(app, installed, latest));
         }).start();
     }
@@ -484,10 +483,9 @@ public class AutoUpdateService extends AccessibilityService {
         if (!running) return;
         verified.add(app.packageName);
 
-        boolean usable = latest != null && !latest.isEmpty()
-                && !latest.equals(PlayStoreVersionFetcher.NET_ERROR)
-                && !latest.equals(PlayStoreVersionFetcher.NO_MATCH);
-        if (!usable) return; // can't tell - the retry budget still applies
+        if (!PlayStoreVersionFetcher.isUsableVersion(latest)) {
+            return; // can't tell - the retry budget still applies
+        }
 
         app.latestVersion = latest; // keep the fresh value for isUpdated / the app list
         if (installed != null && !installed.isEmpty()
@@ -760,10 +758,8 @@ public class AutoUpdateService extends AccessibilityService {
             return !installed.equals(app.currentVersion);
         }
         String latest = app.latestVersion;
-        boolean usableLatest = latest != null && !latest.isEmpty()
-                && !latest.equals(PlayStoreVersionFetcher.NET_ERROR)
-                && !latest.equals(PlayStoreVersionFetcher.NO_MATCH);
-        return usableLatest && !PlayStoreVersionFetcher.isNewerVersion(latest, installed);
+        return PlayStoreVersionFetcher.isUsableVersion(latest)
+                && !PlayStoreVersionFetcher.isNewerVersion(latest, installed);
     }
 
     /**
@@ -777,12 +773,16 @@ public class AutoUpdateService extends AccessibilityService {
                 && !installed.equals(app.currentVersion);
         updatedCount++;
         if (moved) {
+            // Both versions, so the report says what actually changed, not just where it
+            // landed: "5.5 → 5.6".
+            String from = app.currentVersion.isEmpty() ? "?" : app.currentVersion;
             reportItems.add(new BatchReport.Item(app.appName, app.packageName,
-                    BatchReport.STATUS_UPDATED, installed));
+                    BatchReport.STATUS_UPDATED, from + " → " + installed));
             app.currentVersion = installed;
         } else {
             reportItems.add(new BatchReport.Item(app.appName, app.packageName,
-                    BatchReport.STATUS_ALREADY_CURRENT, "already up to date"));
+                    BatchReport.STATUS_ALREADY_CURRENT,
+                    installed == null ? "already up to date" : "already on " + installed));
         }
         forget(app);
     }

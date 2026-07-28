@@ -245,10 +245,8 @@ public class MainActivity extends Activity implements ScanService.Listener {
     }
 
     private boolean isOutdated(SleepingApp a) {
-        if (a.latestVersion == null || a.latestVersion.isEmpty()) return false;
-        if (a.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
-                || a.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) return false;
-        return PlayStoreVersionFetcher.isNewerVersion(a.latestVersion, a.currentVersion);
+        return PlayStoreVersionFetcher.isUsableVersion(a.latestVersion)
+                && PlayStoreVersionFetcher.isNewerVersion(a.latestVersion, a.currentVersion);
     }
 
     private void updateStatus() {
