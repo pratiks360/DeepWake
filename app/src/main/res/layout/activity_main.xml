@@ -51,6 +51,14 @@
             android:gravity="end"
             android:paddingTop="8dp"
             android:paddingBottom="8dp" />
+
+        <Button
+            android:id="@+id/btnReports"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:text="Reports" />
     </LinearLayout>
 
     <androidx.recyclerview.widget.RecyclerView

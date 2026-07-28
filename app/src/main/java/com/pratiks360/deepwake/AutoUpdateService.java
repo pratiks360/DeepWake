@@ -26,6 +26,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -36,20 +37,29 @@ import java.util.Set;
  * itself. The selected apps are worked through in sequential batches of BATCH_SIZE: wake
  * the current batch's apps, drive Play Store to its DOWNLOADS screen (the deep link lands
  * on the Overview tab of "Manage apps and device", which is one click short of it), tap
- * "Check for updates" when nothing is listed, auto-click "Update all", then monitor that
- * batch until each app's installed version actually moves -
- * switching between the woken apps and Play Store as needed. Only when the current batch
- * completes (or stalls) does the next batch of apps get woken; waking 50 apps at once
- * just thrashes the device and re-hibernation undoes most of them before Play Store gets
- * there anyway. On aggressive-hibernation devices a woken app can still slip back to sleep
- * mid-update (Play Store then stalls it), so while waiting we periodically re-wake any
- * pending app in the current batch that has gone back to sleep and re-tap Update all - see
- * maybeRewake. Each app also carries a bounded retry budget: an app Play Store never lists
- * is woken again, then checked directly against its Play Store listing - if nothing newer
- * exists it was only ever "outdated" by a stale scrape and counts as done, otherwise it gets
- * one last wake and is reported as failed. A batch that makes no progress for a while (or
- * hits its hard time cap) is skipped so the run always moves on and finishes on its own -
- * the overlay never sits on Play Store forever waiting for the user to cancel.
+ * "Check for updates" when nothing is listed, auto-click "Update all", then keep tapping the
+ * per-row "Update" button of every app that appears afterwards - once anything is installing
+ * "Update all" becomes "Cancel all", so those per-row buttons are the only way to start the
+ * apps woken later in the batch. The batch is then monitored until each app's installed
+ * version actually moves, switching between the woken apps and Play Store as needed.
+ *
+ * Only when the current batch completes does the next batch of apps get woken; waking 50 apps
+ * at once just thrashes the device and re-hibernation undoes most of them before Play Store
+ * gets there anyway. A batch is never abandoned while Play Store is visibly installing or
+ * downloading (a big app can hold the batch for minutes without any version moving); it moves
+ * on only after real inactivity, or at its hard time cap. On aggressive-hibernation devices a
+ * woken app can still slip back to sleep mid-update (Play Store then stalls it), so while
+ * waiting we periodically re-wake any pending app in the current batch that has gone back to
+ * sleep and re-tap Update all - see maybeRewake. Each app also carries a bounded retry budget:
+ * an app Play Store never lists is woken again, then checked directly against its Play Store
+ * listing - if nothing newer exists it was only ever "outdated" by a stale scrape and counts
+ * as done, otherwise it gets one last wake and is reported as failed.
+ *
+ * Progress is swept across the WHOLE run every tick, not just the live batch: Play Store's own
+ * install queue ignores our batching and keeps working long after we've moved on, so apps
+ * routinely land while a later batch is on screen. Anything a batch does leave behind is
+ * watched to the end of the run (see drain) before the report is written, and that report is
+ * persisted - the last five runs are browsable from MainActivity.
  *
  * Why an AccessibilityService: it is the only sanctioned mechanism that can (a) click
  * buttons inside another app (Play Store) and (b) draw a TYPE_ACCESSIBILITY_OVERLAY that
@@ -92,21 +102,41 @@ public class AutoUpdateService extends AccessibilityService {
     // installs one app at a time, and a batch-wide re-wake cycle bumps every pending app's
     // attempt count at once, so without this an app could be retired mid-download.
     private static final int RESOLVE_IDLE_TICKS = 12; // ~60s of no progress in the batch
+    // A batch is NOT stalled while Play Store is visibly working on one of its apps, however
+    // long that takes - a 600 MB download makes no "progress" by our measure for minutes.
+    private static final int BUSY_GRACE_TICKS = 6;    // ~30s since the last busy row was seen
+    // After the last batch, apps an earlier batch left mid-install are watched (not re-woken)
+    // so they land in the report as updated rather than as failures.
+    private static final int DRAIN_MAX_TICKS = 36;    // ~3 min hard cap on that wait
+    private static final int DRAIN_IDLE_TICKS = 12;   // ...or ~60s of nothing happening
+    private static final long UPDATE_ALL_COOLDOWN_MS = 5000;  // min gap between "Update all" taps
+    private static final long PER_APP_CLICK_COOLDOWN_MS = 8000; // ...and per row "Update" taps
+    private static final int MAX_NODES = 900;         // cap on one page-tree snapshot
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
     // Labels used to drive Play Store's UI. The Downloads screen is the only page with a
     // real "Update all"; the Overview page of "Manage apps and device" carries a row that
     // navigates INTO Downloads, which is where the deep link tends to land instead.
-    private static final String[] UPDATE_LABELS = {"Update all", "Update"};
+    // Once anything is installing, "Update all" turns into "Cancel all" - which is why the
+    // per-row "Update" buttons (see clickPerAppUpdates) are the only way to start the apps
+    // that Play Store lists later, as each newly woken app appears.
+    private static final String UPDATE_ALL_LABEL = "Update all";
+    private static final String UPDATE_LABEL = "Update";
     private static final String CHECK_LABEL = "Check for updates";
     private static final String[] DOWNLOADS_MARKERS =
-            {"Downloads", CHECK_LABEL, "Update all", "You're ready"};
+            {"Downloads", CHECK_LABEL, UPDATE_ALL_LABEL, "Cancel all", "You're ready"};
     private static final String[] DOWNLOADS_ENTRY_LABELS =
             {"Updates available", "All apps up to date", "See details"};
+    // Row status text that means Play Store is actively working on that app. Matched as a
+    // lowercase prefix, so "Installing...", "Pending..." and "Downloading 12 MB of 45 MB"
+    // all count.
+    // Deliberately only ACTIVE work - "Pending..." rows can sit there indefinitely behind a
+    // download that will never start (no Wi-Fi, no storage), and treating those as busy would
+    // hold a batch open for nothing.
+    private static final String[] BUSY_MARKERS = {"installing", "downloading", "verifying"};
 
-    // Extras on the MainActivity relaunch intent carrying the finished run's report.
-    public static final String EXTRA_REPORT_UPDATED = "com.pratiks360.deepwake.REPORT_UPDATED";
-    public static final String EXTRA_REPORT_NOT_UPDATED = "com.pratiks360.deepwake.REPORT_NOT_UPDATED";
+    // Extra on the MainActivity relaunch intent: the id of the report just written to the DB.
+    public static final String EXTRA_REPORT_ID = "com.pratiks360.deepwake.REPORT_ID";
 
     // Accessibility services are singletons managed by the system; this is the standard
     // way for the rest of the app to reach the live instance (null = not enabled).
@@ -127,23 +157,30 @@ public class AutoUpdateService extends AccessibilityService {
     // below operates on pending only - the queue feeds it one batch at a time.
     private final List<SleepingApp> queue = new ArrayList<>();
     private final List<SleepingApp> pending = new ArrayList<>();
-    private final ArrayList<String> updatedNames = new ArrayList<>();
-    private final ArrayList<String> skippedNames = new ArrayList<>();
+    // Apps a stalled/capped batch left behind. Play Store usually IS still installing them
+    // (it installs one app at a time, from a queue that outlives our batch), so instead of
+    // writing them off they keep being swept for completion until the run ends.
+    private final List<SleepingApp> deferred = new ArrayList<>();
+    private final List<BatchReport.Item> reportItems = new ArrayList<>();
     // Per-package wake attempts and which packages have already been re-checked against
     // Play Store, so each app is chased a bounded number of times and verified only once.
     private final Map<String, Integer> wakeAttempts = new HashMap<>();
     private final Set<String> verified = new HashSet<>();
     private final Set<String> verifyInFlight = new HashSet<>();
+    // Last tap per Play Store row label, so a row's "Update" isn't re-tapped every poll
+    // while the UI catches up.
+    private final Map<String, Long> lastRowClick = new HashMap<>();
     private int totalSelected;
-    private int totalBatches;
     private int batchNumber;      // 1-based, for the overlay status
     private int updatedCount;
-    private int skippedCount;     // apps abandoned when their batch stalled / hit the cap
     private int lastProgressTick; // tick (within the current batch) of the last update
+    private int currentTick;      // tick the monitor/drain loop is on, for busy bookkeeping
+    private int busyTick = -1;    // last tick Play Store looked busy for our apps (-1 = never)
     private boolean running;
     private boolean autoClickArmed;
     private long lastReopenAttempt;
     private long lastCheckClick;     // last "Check for updates" tap, for its cooldown
+    private long lastUpdateAllClick; // last "Update all" tap, for its cooldown
     private int emptyDownloadsStreak; // polls seeing an empty Downloads AFTER a completed check
     private int wakeCyclesThisBatch;  // wake-all + re-check rounds run for the current batch
 
@@ -195,17 +232,17 @@ public class AutoUpdateService extends AccessibilityService {
         if (running || apps == null || apps.isEmpty()) return;
         running = true;
         updatedCount = 0;
-        skippedCount = 0;
         batchNumber = 0;
-        updatedNames.clear();
-        skippedNames.clear();
+        busyTick = -1;
+        reportItems.clear();
         wakeAttempts.clear();
         verified.clear();
         verifyInFlight.clear();
+        lastRowClick.clear();
+        deferred.clear();
         queue.clear();
         queue.addAll(apps);
         totalSelected = queue.size();
-        totalBatches = (totalSelected + BATCH_SIZE - 1) / BATCH_SIZE;
         showOverlay();
         startNextBatch();
     }
@@ -218,11 +255,21 @@ public class AutoUpdateService extends AccessibilityService {
             pending.add(queue.remove(0));
         }
         if (pending.isEmpty()) {
-            finishFlow();
+            // Queue exhausted. Anything an earlier batch left mid-install gets watched a
+            // while longer before the report is written; otherwise finish now.
+            if (deferred.isEmpty()) {
+                finishFlow();
+            } else {
+                lastProgressTick = 0;
+                setOverlayStatus("Finishing " + deferred.size() + " app(s) still installing...");
+                armAutoClick();
+                handler.postDelayed(() -> drain(0), VERIFY_INTERVAL_MS);
+            }
             return;
         }
         batchNumber++;
         lastProgressTick = 0;
+        busyTick = -1;    // tick counters restart per batch, so the busy mark must too
         emptyDownloadsStreak = 0;
         wakeCyclesThisBatch = 0;
         lastCheckClick = 0;   // the new batch may need an immediate re-check
@@ -250,29 +297,22 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     /**
-     * Loop over the CURRENT batch: sweep for completed updates, re-wake any app that
-     * slipped back to sleep, keep Play Store tapping "Update all". When the batch empties
-     * it rolls straight into the next one; a batch with no progress for a while (or at its
-     * hard cap) is skipped so one stuck app can't wedge the rest of the queue - either way
-     * the overlay always dismisses itself instead of sitting on Play Store forever.
+     * Loop over the CURRENT batch: sweep the whole run for completed updates, re-wake any app
+     * that slipped back to sleep, keep Play Store tapping Update. When the batch empties it
+     * rolls straight into the next one. A batch is left behind only after real inactivity -
+     * never while Play Store is installing one of its apps - or at its hard cap, so one stuck
+     * app can't wedge the rest of the queue; what it leaves behind is handed to `deferred`
+     * and still counted if it lands later, and the overlay always dismisses itself instead of
+     * sitting on Play Store forever.
      * resolvePending additionally retires individual apps that have burnt their retry
      * budget, so a single never-listed app is settled on its own terms (verified against
      * Play Store, then updated-or-failed) rather than dragging the batch to the timeout.
      */
     private void monitor(int tick) {
         if (!running) return;
+        currentTick = tick;
 
-        boolean progressed = false;
-        Iterator<SleepingApp> it = pending.iterator();
-        while (it.hasNext()) {
-            SleepingApp app = it.next();
-            if (isUpdated(app)) {
-                markUpdated(app); // increments updatedCount + drops it from stored list
-                it.remove();
-                progressed = true;
-            }
-        }
-        if (progressed) lastProgressTick = tick;
+        if (sweepCompleted()) lastProgressTick = tick;
 
         // Retire apps that have used up their retry budget, so the batch shrinks instead of
         // one never-listed app holding the whole run to the stall timeout.
@@ -284,7 +324,8 @@ public class AutoUpdateService extends AccessibilityService {
         }
 
         setOverlayStatus(batchLabel() + updatedCount + "/" + totalSelected + " updated, "
-                + pending.size() + " in this batch...");
+                + pending.size() + " in this batch"
+                + (deferred.isEmpty() ? "..." : " (" + deferred.size() + " finishing)..."));
 
         // Skip this batch if it hit its hard cap, or if nothing has updated for a while AND
         // nothing is still asleep (so re-waking has nothing left to try - Play Store simply
@@ -292,12 +333,26 @@ public class AutoUpdateService extends AccessibilityService {
         // up before at least one full wake-all + re-check cycle has run, though: that cycle
         // is the only thing that makes a re-slept app visible to Play Store's check, and
         // abandoning the batch first is what left apps behind as "Not updated".
-        boolean stalled = (tick - lastProgressTick) >= STALL_TICKS && allAwake()
+        //
+        // And never while Play Store is visibly installing/downloading one of this batch's
+        // apps: a big app can sit at "Installing..." well past STALL_TICKS without any
+        // version moving, and abandoning the batch there is exactly what was marching the
+        // run through batches with nothing counted as updated.
+        boolean busy = isBusy(tick);
+        boolean stalled = !busy && (tick - lastProgressTick) >= STALL_TICKS && allAwake()
                 && wakeCyclesThisBatch > 0;
         if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
-            skippedCount += pending.size();
-            for (SleepingApp app : pending) skippedNames.add(app.appName);
+            deferred.addAll(pending);   // keep watching them; the run reports on them at the end
+            pending.clear();
             startNextBatch();
+            return;
+        }
+
+        if (busy) {
+            // Play Store is working through this batch - leave it alone. The auto-click poll
+            // stays armed so each row's own "Update" is still tapped as it appears; waking
+            // apps or restarting Play Store here would only interrupt a live install.
+            handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
             return;
         }
 
@@ -318,6 +373,63 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     /**
+     * Sweeps EVERY app in the run - the current batch, the apps a stalled batch left behind
+     * and the ones still queued - for an install that has landed, and counts each one.
+     *
+     * Sweeping all three is the point: Play Store's own queue doesn't respect our batching
+     * (an "Update all" tap starts everything it has listed, and installs keep running long
+     * after we've moved on), so an app frequently finishes while some later batch is on
+     * screen. Only ever checking the current batch is what pinned the counter at "0/22"
+     * while Play Store was visibly installing the apps.
+     */
+    private boolean sweepCompleted() {
+        boolean progressed = sweepList(pending);
+        progressed |= sweepList(deferred);
+        progressed |= sweepList(queue);
+        return progressed;
+    }
+
+    private boolean sweepList(List<SleepingApp> apps) {
+        boolean progressed = false;
+        Iterator<SleepingApp> it = apps.iterator();
+        while (it.hasNext()) {
+            SleepingApp app = it.next();
+            if (isUpdated(app)) {
+                markUpdated(app); // counts it + drops it from the tracked list
+                it.remove();
+                progressed = true;
+            }
+        }
+        return progressed;
+    }
+
+    /** True while Play Store was recently seen installing/downloading one of our apps. */
+    private boolean isBusy(int tick) {
+        return busyTick >= 0 && tick - busyTick <= BUSY_GRACE_TICKS;
+    }
+
+    /**
+     * The tail of a run: every batch has been through, but Play Store may still be installing
+     * apps that earlier batches handed off. Nothing is woken or re-driven here - the poll
+     * keeps tapping any per-row "Update" that shows up, and this just watches the installs
+     * land so they're reported as updated instead of as failures.
+     */
+    private void drain(int tick) {
+        if (!running) return;
+        currentTick = tick;
+        if (sweepCompleted()) lastProgressTick = tick;
+
+        boolean idle = !isBusy(tick) && (tick - lastProgressTick) >= DRAIN_IDLE_TICKS;
+        if (deferred.isEmpty() || idle || tick + 1 >= DRAIN_MAX_TICKS) {
+            finishFlow();
+            return;
+        }
+        setOverlayStatus(updatedCount + "/" + totalSelected + " updated - finishing "
+                + deferred.size() + " app(s) still installing...");
+        handler.postDelayed(() -> drain(tick + 1), VERIFY_INTERVAL_MS);
+    }
+
+    /**
      * Enforces the per-app retry budget. When Play Store lists 3 of a batch's 4 apps, the
      * missing one gets woken again by the normal cycles; this decides when to stop chasing:
      *
@@ -331,6 +443,7 @@ public class AutoUpdateService extends AccessibilityService {
     private void resolvePending(int tick) {
         if (!running) return;
         if (tick - lastProgressTick < RESOLVE_IDLE_TICKS) return; // batch still moving
+        if (isBusy(tick)) return; // Play Store is installing - nothing here has failed yet
         List<SleepingApp> toVerify = new ArrayList<>();
         Iterator<SleepingApp> it = pending.iterator();
         while (it.hasNext()) {
@@ -380,8 +493,9 @@ public class AutoUpdateService extends AccessibilityService {
         if (installed != null && !installed.isEmpty()
                 && !PlayStoreVersionFetcher.isNewerVersion(latest, installed)) {
             // Nothing newer exists: the installed build IS the current one, so the app was
-            // only ever "outdated" because of a stale scrape. Retire it as done.
-            if (pending.remove(app)) markAlreadyCurrent(app);
+            // only ever "outdated" because of a stale scrape. Retire it as done - markUpdated
+            // records it as "already up to date" since its version never moved.
+            if (pending.remove(app)) markUpdated(app);
         }
     }
 
@@ -390,9 +504,10 @@ public class AutoUpdateService extends AccessibilityService {
         return n == null ? 0 : n;
     }
 
+    /** Out of retries with a genuinely newer version still on the store - report it as failed. */
     private void markFailed(SleepingApp app) {
-        skippedCount++;
-        skippedNames.add(app.appName);
+        reportItems.add(new BatchReport.Item(app.appName, app.packageName,
+                BatchReport.STATUS_FAILED, "Play Store never listed it"));
     }
 
     /**
@@ -464,8 +579,14 @@ public class AutoUpdateService extends AccessibilityService {
         handler.postDelayed(() -> wakePendingStep(i + 1), STAGGER_MS);
     }
 
+    /**
+     * "Batch 4 of 6" - recomputed rather than fixed at start, because apps still queued can
+     * finish on their own (Play Store's "Update all" starts everything it has listed), which
+     * shortens the run.
+     */
     private String batchLabel() {
-        return totalBatches > 1 ? "Batch " + batchNumber + " of " + totalBatches + "\n" : "";
+        int total = batchNumber + (queue.size() + BATCH_SIZE - 1) / BATCH_SIZE;
+        return total > 1 ? "Batch " + batchNumber + " of " + total + "\n" : "";
     }
 
     private void armAutoClick() {
@@ -525,7 +646,9 @@ public class AutoUpdateService extends AccessibilityService {
         if (!running) return;
         AccessibilityNodeInfo root = findPlayStoreRoot();
         if (root == null) return;
-        if (!onDownloadsPage(root)) {
+        List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+        collectNodes(root, nodes, 0);
+        if (!onDownloadsPage(nodes)) {
             // Still on the Overview page - step into Downloads and re-check shortly after.
             for (String entry : DOWNLOADS_ENTRY_LABELS) {
                 if (clickByLabelDfs(root, entry, 0)) {
@@ -572,21 +695,35 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void finishFlow() {
-        // Normal finish happens with pending/queue empty, but a mid-run stop can leave both
-        // populated - everything not updated counts as still pending.
-        ArrayList<String> notUpdated = new ArrayList<>(skippedNames);
-        for (SleepingApp app : pending) notUpdated.add(app.appName);
-        for (SleepingApp app : queue) notUpdated.add(app.appName);
-        int pend = notUpdated.size();
+        // Normal finish happens with every list empty, but the drain's time cap - or a mid-run
+        // stop - can leave apps behind; those are recorded as still pending, not as failures,
+        // since Play Store may well finish them minutes later.
+        for (SleepingApp app : deferred) addPending(app, "still installing");
+        for (SleepingApp app : pending) addPending(app, "not reached");
+        for (SleepingApp app : queue) addPending(app, "not reached");
+        int outstanding = 0;
+        for (BatchReport.Item item : reportItems) {
+            if (!BatchReport.STATUS_UPDATED.equals(item.status)
+                    && !BatchReport.STATUS_ALREADY_CURRENT.equals(item.status)) {
+                outstanding++;
+            }
+        }
         stopFlowInternal();
         Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
-                + (pend > 0 ? ", " + pend + " still pending" : ""),
+                + (outstanding > 0 ? ", " + outstanding + " still pending" : ""),
                 Toast.LENGTH_LONG).show();
-        // Hand the report to MainActivity, which shows it as a dialog.
+
+        // The report is persisted (last 5 runs are kept) and MainActivity is handed its id
+        // rather than the contents, so the same report can be reopened later from history.
+        long reportId = AppRepository.saveReport(this, reportItems, totalSelected, updatedCount);
         Intent report = new Intent(this, MainActivity.class);
-        report.putStringArrayListExtra(EXTRA_REPORT_UPDATED, new ArrayList<>(updatedNames));
-        report.putStringArrayListExtra(EXTRA_REPORT_NOT_UPDATED, notUpdated);
+        report.putExtra(EXTRA_REPORT_ID, reportId);
         bringDeepWakeToFront(report);
+    }
+
+    private void addPending(SleepingApp app, String detail) {
+        reportItems.add(new BatchReport.Item(app.appName, app.packageName,
+                BatchReport.STATUS_PENDING, detail));
     }
 
     private void cancelFlow(boolean returnToApp) {
@@ -604,38 +741,55 @@ public class AutoUpdateService extends AccessibilityService {
 
     // ---------------------------------------------------------------- verification
 
+    /**
+     * Has this app's update landed? The installed version simply MOVING off the version
+     * recorded at scan time is the primary signal - Play Store is the only thing updating
+     * these apps, so a changed version means it did.
+     *
+     * The old test demanded installed.equals(latestVersion), an exact string match against a
+     * version scraped off the store page. Those two strings routinely differ for the same
+     * build ("8.1.2" on the listing vs "8.1.2.4-release" in the package), so genuinely
+     * updated apps kept failing the check and the run reported nothing as updated even while
+     * Play Store showed them installing. The scraped version is now only a fallback, used
+     * when there is no usable baseline to compare against.
+     */
     private boolean isUpdated(SleepingApp app) {
         String installed = getInstalledVersion(app.packageName);
-        if (app.latestVersion != null && !app.latestVersion.isEmpty()
-                && !app.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
-                && !app.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) {
-            return app.latestVersion.equals(installed);
+        if (installed == null) return false; // uninstalled mid-run - not something we did
+        if (app.currentVersion != null && !app.currentVersion.isEmpty()) {
+            return !installed.equals(app.currentVersion);
         }
-        return installed != null && !installed.equals(app.currentVersion);
-    }
-
-    private void markUpdated(SleepingApp app) {
-        updatedCount++;
-        updatedNames.add(app.appName);
-        forget(app);
+        String latest = app.latestVersion;
+        boolean usableLatest = latest != null && !latest.isEmpty()
+                && !latest.equals(PlayStoreVersionFetcher.NET_ERROR)
+                && !latest.equals(PlayStoreVersionFetcher.NO_MATCH);
+        return usableLatest && !PlayStoreVersionFetcher.isNewerVersion(latest, installed);
     }
 
     /**
-     * The app turned out to already be on Play Store's latest version - it only looked
-     * outdated because the stored "latest" came from an earlier, stale scrape. Counted with
-     * the updated apps (nothing is left to do for it) but labelled so the report is honest.
+     * Counts the app as done and stops tracking it. An app whose version never moved was
+     * already on the latest build - the stored "latest" came from a stale scrape - so it's
+     * recorded as such rather than claimed as an update this run performed.
      */
-    private void markAlreadyCurrent(SleepingApp app) {
+    private void markUpdated(SleepingApp app) {
+        String installed = getInstalledVersion(app.packageName);
+        boolean moved = installed != null && app.currentVersion != null
+                && !installed.equals(app.currentVersion);
         updatedCount++;
-        updatedNames.add(app.appName + " (already up to date)");
+        if (moved) {
+            reportItems.add(new BatchReport.Item(app.appName, app.packageName,
+                    BatchReport.STATUS_UPDATED, installed));
+            app.currentVersion = installed;
+        } else {
+            reportItems.add(new BatchReport.Item(app.appName, app.packageName,
+                    BatchReport.STATUS_ALREADY_CURRENT, "already up to date"));
+        }
         forget(app);
     }
 
     /** Drop the app from the tracked list - it no longer needs updating. */
     private void forget(SleepingApp app) {
-        List<SleepingApp> all = AppListStorage.load(this);
-        all.removeIf(a -> a.packageName.equals(app.packageName));
-        AppListStorage.save(this, all);
+        AppRepository.removeApp(this, app.packageName);
     }
 
     private String getInstalledVersion(String packageName) {
@@ -728,8 +882,11 @@ public class AutoUpdateService extends AccessibilityService {
      *      programmatic click on the node, so it works even though our tint overlay sits on
      *      top, AND even if Play Store's window isn't flagged "active" (our overlay can steal
      *      that flag - which is exactly why an isActive()-gated approach never clicked).
-     *      One tap triggers every listed update, so we disarm after a hit.
-     *   4. On Downloads with nothing listed ("You're ready") -> tap "Check for updates" and
+     *   4. On Downloads mid-run -> "Update all" has become "Cancel all", and every app woken
+     *      since then is listed with its own "Update" button. Tap those, one per pass. This
+     *      is what actually gets a batch's later apps moving; the poll deliberately stays
+     *      armed for the whole batch instead of stopping after the first "Update all".
+     *   5. On Downloads with nothing listed ("You're ready") -> tap "Check for updates" and
      *      let it finish. If it still lists nothing, count that; once the count trips,
      *      monitor() re-wakes the whole batch and comes back here (see the empty-Downloads
      *      handling in monitor) - a sleeping app is invisible to Play Store's check, so the
@@ -744,7 +901,12 @@ public class AutoUpdateService extends AccessibilityService {
             return;
         }
 
-        if (!onDownloadsPage(root)) {
+        // One tree snapshot per pass, shared by every check below - the page detection,
+        // the busy scan and the button hunt used to walk the tree separately each time.
+        List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+        collectNodes(root, nodes, 0);
+
+        if (!onDownloadsPage(nodes)) {
             // Navigate into Downloads from wherever we landed (usually the Overview tab).
             for (String entry : DOWNLOADS_ENTRY_LABELS) {
                 if (clickByLabelDfs(root, entry, 0)) return;
@@ -753,17 +915,42 @@ public class AutoUpdateService extends AccessibilityService {
             return;
         }
 
-        for (String label : UPDATE_LABELS) {
-            if (clickButtonLabeled(root, label)) {
-                emptyDownloadsStreak = 0;
-                disarmAutoClick();
-                return;
-            }
+        // Tell the monitor whether Play Store is actually working, so it waits out a long
+        // install instead of calling the batch stalled and moving on.
+        if (pageBusy(nodes)) {
+            busyTick = currentTick;
+            emptyDownloadsStreak = 0;
         }
+
+        long now = System.currentTimeMillis();
+
+        // "Update all" starts everything Play Store has listed right now. It's only present
+        // while nothing is installing - the moment one download starts it becomes "Cancel
+        // all", which our exact-match lookup will never hit (and must never click).
+        if (now - lastUpdateAllClick >= UPDATE_ALL_COOLDOWN_MS
+                && clickByLabelDfs(root, UPDATE_ALL_LABEL, 0)) {
+            lastUpdateAllClick = now;
+            emptyDownloadsStreak = 0;
+            return;
+        }
+
+        // ...which leaves the apps Play Store lists AFTER that tap: each app woken later
+        // appears with its own "Update" button next to it while the rest are already
+        // installing. Those rows are the only way to start them, so the poll stays armed and
+        // taps them as they show up (it used to disarm after one "Update all" and never come
+        // back, which is why the later apps of a batch were never started).
+        if (clickPerAppUpdates(nodes, now)) {
+            emptyDownloadsStreak = 0;
+            return;
+        }
+
+        // Downloads has no button left to press. If installs are running that's simply the
+        // waiting state - don't re-check (a check mid-install just churns the list) and don't
+        // start counting empty polls toward a re-wake.
+        if (isBusy(currentTick)) return;
 
         // On Downloads, nothing to update. Ask Play Store to re-check - rate-limited, since
         // re-tapping mid-check just restarts it and the check can never settle.
-        long now = System.currentTimeMillis();
         if (now - lastCheckClick >= CHECK_COOLDOWN_MS) {
             if (clickByLabelDfs(root, CHECK_LABEL, 0)) {
                 lastCheckClick = now;
@@ -780,12 +967,120 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
+    /** Flattens the page into a node list once, so a pass doesn't re-walk it per lookup. */
+    private void collectNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out, int depth) {
+        if (node == null || depth > 40 || out.size() >= MAX_NODES) return;
+        out.add(node);
+        for (int i = 0; i < node.getChildCount(); i++) {
+            collectNodes(node.getChild(i), out, depth + 1);
+        }
+    }
+
+    /** A node's visible label: its text, or its content description when it has no text. */
+    private String labelOf(AccessibilityNodeInfo node) {
+        CharSequence text = node.getText();
+        if (text != null && text.toString().trim().length() > 0) return text.toString().trim();
+        CharSequence desc = node.getContentDescription();
+        if (desc != null && desc.toString().trim().length() > 0) return desc.toString().trim();
+        return null;
+    }
+
     /** True when the visible Play Store page is the Downloads screen. */
-    private boolean onDownloadsPage(AccessibilityNodeInfo root) {
-        for (String marker : DOWNLOADS_MARKERS) {
-            if (findByLabelDfs(root, marker, 0) != null) return true;
+    private boolean onDownloadsPage(List<AccessibilityNodeInfo> nodes) {
+        for (AccessibilityNodeInfo node : nodes) {
+            String label = labelOf(node);
+            if (label == null) continue;
+            for (String marker : DOWNLOADS_MARKERS) {
+                if (label.equalsIgnoreCase(marker)) return true;
+            }
         }
         return false;
+    }
+
+    /**
+     * True when any row on Downloads is actively installing or downloading.
+     *
+     * Not restricted to this batch's apps on purpose: Play Store queues everything it has
+     * listed (an "Update all" tap starts far more than our four) and installs them strictly
+     * one at a time, so a row we didn't ask for is still the reason ours haven't landed yet.
+     * Waiting it out is right either way - and the batch's own 15-minute cap stops this from
+     * becoming an indefinite hold.
+     */
+    private boolean pageBusy(List<AccessibilityNodeInfo> nodes) {
+        for (AccessibilityNodeInfo node : nodes) {
+            String label = labelOf(node);
+            if (label == null) continue;
+            String lower = label.toLowerCase(Locale.US);
+            for (String marker : BUSY_MARKERS) {
+                if (lower.startsWith(marker) || lower.contains(" " + marker)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Taps one row's own "Update" button per pass. Exact-match on the label, so it can never
+     * hit "Update all" (handled separately), "Cancel all" or a row's "Updated on ..." text.
+     *
+     * One per pass because the list re-lays out as soon as a row starts installing - clicking
+     * several stale nodes from the same snapshot mostly hits moved rows. The per-row cooldown
+     * (keyed on the app name the button sits next to) stops a row being re-tapped every 1.2s
+     * while Play Store catches up.
+     */
+    private boolean clickPerAppUpdates(List<AccessibilityNodeInfo> nodes, long now) {
+        for (AccessibilityNodeInfo node : nodes) {
+            String label = labelOf(node);
+            if (label == null || !label.equalsIgnoreCase(UPDATE_LABEL)) continue;
+            String row = rowTitleFor(node);
+            String key = row == null ? "row@" + nodes.indexOf(node) : row;
+            Long last = lastRowClick.get(key);
+            if (last != null && now - last < PER_APP_CLICK_COOLDOWN_MS) continue;
+            if (clickSelfOrAncestor(node)) {
+                lastRowClick.put(key, now);
+                setOverlayStatus(batchLabel() + "Updating " + (row == null ? "an app" : row) + "...");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The app name a per-row button belongs to - the row's longest non-status label. */
+    private String rowTitleFor(AccessibilityNodeInfo button) {
+        AccessibilityNodeInfo container = button;
+        for (int i = 0; i < 3; i++) {
+            AccessibilityNodeInfo parent = container.getParent();
+            if (parent == null) break;
+            container = parent;
+            String title = longestLabel(container, 0, null);
+            if (title != null && title.length() > 3) return title;
+        }
+        return null;
+    }
+
+    private String longestLabel(AccessibilityNodeInfo node, int depth, String best) {
+        if (node == null || depth > 6) return best;
+        String label = labelOf(node);
+        if (label != null && !isStatusLabel(label)
+                && (best == null || label.length() > best.length())) {
+            best = label;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            best = longestLabel(node.getChild(i), depth + 1, best);
+        }
+        return best;
+    }
+
+    /** Row furniture rather than an app name: the button itself, a status, or a size. */
+    private boolean isStatusLabel(String label) {
+        String lower = label.toLowerCase(Locale.US);
+        if (lower.equals("update") || lower.equals("update all") || lower.equals("cancel all")
+                || lower.equals("cancel") || lower.equals("open") || lower.equals("more options")) {
+            return true;
+        }
+        for (String marker : BUSY_MARKERS) {
+            if (lower.startsWith(marker)) return true;
+        }
+        return lower.matches("^[0-9.,]+\\s*(b|kb|mb|gb)\\b.*") || lower.startsWith("pending");
     }
 
     private void maybeReopen(boolean playStoreShowing) {
@@ -825,14 +1120,12 @@ public class AutoUpdateService extends AccessibilityService {
         return null;
     }
 
-    private boolean clickButtonLabeled(AccessibilityNodeInfo root, String label) {
-        // Full-tree DFS rather than findAccessibilityNodeInfosByText(), which can miss
-        // Compose-rendered elements - and on the "Manage apps & device" Overview screen
-        // "Update all" is a Compose text link, not a classic Button, so the old shallow
-        // lookup found nothing clickable and never tapped it.
-        return clickByLabelDfs(root, label, 0);
-    }
-
+    /**
+     * Full-tree DFS rather than findAccessibilityNodeInfosByText(), which can miss
+     * Compose-rendered elements - and on the "Manage apps & device" Overview screen
+     * "Update all" is a Compose text link, not a classic Button, so the old shallow
+     * lookup found nothing clickable and never tapped it.
+     */
     private boolean clickByLabelDfs(AccessibilityNodeInfo node, String label, int depth) {
         if (node == null || depth > 40) return false;
         if (labelMatches(node, label) && clickSelfOrAncestor(node)) return true;
@@ -840,17 +1133,6 @@ public class AutoUpdateService extends AccessibilityService {
             if (clickByLabelDfs(node.getChild(i), label, depth + 1)) return true;
         }
         return false;
-    }
-
-    /** Same walk as clickByLabelDfs but read-only - used to identify which page is showing. */
-    private AccessibilityNodeInfo findByLabelDfs(AccessibilityNodeInfo node, String label, int depth) {
-        if (node == null || depth > 40) return null;
-        if (labelMatches(node, label)) return node;
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo hit = findByLabelDfs(node.getChild(i), label, depth + 1);
-            if (hit != null) return hit;
-        }
-        return null;
     }
 
     private boolean labelMatches(AccessibilityNodeInfo node, String label) {
