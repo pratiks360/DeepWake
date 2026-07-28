@@ -36,7 +36,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
     private final Set<String> trackedPackages = new HashSet<>();
     private AppListAdapter adapter;
     private RecyclerView recyclerView;
-    private Button btnScan, btnUpdateAll;
+    private Button btnScan, btnUpdateAll, btnReports;
     private CheckBox cbSelectAll;
     private TextView statusText;
 
@@ -65,6 +65,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
 
         btnScan = findViewById(R.id.btnScan);
         btnUpdateAll = findViewById(R.id.btnUpdateAll);
+        btnReports = findViewById(R.id.btnReports);
         cbSelectAll = findViewById(R.id.cbSelectAll);
         statusText = findViewById(R.id.statusText);
 
@@ -113,6 +114,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
             }
             svc.startBatchUpdate(selected);
         });
+        btnReports.setOnClickListener(v -> showReportHistory());
 
         maybeShowBatchReport(getIntent());
     }
@@ -125,37 +127,49 @@ public class MainActivity extends Activity implements ScanService.Listener {
     }
 
     /**
-     * AutoUpdateService relaunches this activity with a result summary when a batch run
-     * finishes; show it as a report dialog. The extras are cleared afterwards so a config
-     * change / recreation doesn't replay the same report.
+     * AutoUpdateService relaunches this activity when a batch run finishes, carrying the id
+     * of the report it just wrote; look that report up and show it. Only the id travels in
+     * the Intent - the report itself lives in the DB, which is what makes it reopenable later
+     * from the history. The extra is cleared afterwards so a config change / recreation
+     * doesn't replay the same report.
      */
     private void maybeShowBatchReport(Intent intent) {
-        if (intent == null || !intent.hasExtra(AutoUpdateService.EXTRA_REPORT_UPDATED)) return;
-        ArrayList<String> updated = intent.getStringArrayListExtra(AutoUpdateService.EXTRA_REPORT_UPDATED);
-        ArrayList<String> notUpdated = intent.getStringArrayListExtra(AutoUpdateService.EXTRA_REPORT_NOT_UPDATED);
-        intent.removeExtra(AutoUpdateService.EXTRA_REPORT_UPDATED);
-        intent.removeExtra(AutoUpdateService.EXTRA_REPORT_NOT_UPDATED);
-
-        StringBuilder sb = new StringBuilder();
-        if (updated != null && !updated.isEmpty()) {
-            sb.append("Updated (").append(updated.size()).append("):\n");
-            for (String name : updated) sb.append("  ✓ ").append(name).append("\n");
-        } else {
-            sb.append("No apps were updated.\n");
+        if (intent == null || !intent.hasExtra(AutoUpdateService.EXTRA_REPORT_ID)) return;
+        long id = intent.getLongExtra(AutoUpdateService.EXTRA_REPORT_ID, -1);
+        intent.removeExtra(AutoUpdateService.EXTRA_REPORT_ID);
+        for (BatchReport report : AppRepository.loadRecentReports(this)) {
+            if (report.id == id) {
+                showReport(report);
+                break;
+            }
         }
-        if (notUpdated != null && !notUpdated.isEmpty()) {
-            sb.append("\nNot updated (").append(notUpdated.size()).append("):\n");
-            for (String name : notUpdated) sb.append("  ✗ ").append(name).append("\n");
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle("Batch update report")
-                .setMessage(sb.toString().trim())
-                .setPositiveButton("OK", null)
-                .show();
-
         // The batch removed updated apps from storage while we were unbound - refresh.
         reloadFromStorage();
+    }
+
+    /** The stored runs, newest first - one row per run, tap a row to read that report. */
+    private void showReportHistory() {
+        List<BatchReport> reports = AppRepository.loadRecentReports(this);
+        if (reports.isEmpty()) {
+            Toast.makeText(this, "No batch updates have finished yet", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        CharSequence[] rows = new CharSequence[reports.size()];
+        for (int i = 0; i < reports.size(); i++) rows[i] = reports.get(i).rowLabel();
+        new AlertDialog.Builder(this)
+                .setTitle("Recent update runs")
+                .setItems(rows, (d, which) -> showReport(reports.get(which)))
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void showReport(BatchReport report) {
+        new AlertDialog.Builder(this)
+                .setTitle(report.title())
+                .setMessage(report.body())
+                .setPositiveButton("OK", null)
+                .setNeutralButton("All reports", (d, w) -> showReportHistory())
+                .show();
     }
 
     /**
@@ -203,7 +217,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
     }
 
     private void reloadFromStorage() {
-        List<SleepingApp> all = AppListStorage.load(this);
+        List<SleepingApp> all = AppRepository.loadApps(this);
         trackedPackages.clear();
         appList.clear();
         boolean selectAll = cbSelectAll == null || cbSelectAll.isChecked();

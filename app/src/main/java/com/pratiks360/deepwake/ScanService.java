@@ -130,7 +130,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
             // every row up front as "checking...". No network here, so it returns quickly.
             // preserve any previously tracked entries not re-encountered this scan
             Map<String, SleepingApp> merged = new LinkedHashMap<>();
-            for (SleepingApp a : AppListStorage.load(this)) merged.put(a.packageName, a);
+            for (SleepingApp a : AppRepository.loadApps(this)) merged.put(a.packageName, a);
 
             List<SleepingApp> toFetch = new ArrayList<>();
             for (ApplicationInfo info : pm.getInstalledApplications(0)) {
@@ -166,9 +166,9 @@ public class ScanService extends Service implements UpdateManager.Listener {
 
             // Fixed snapshot of everything we persist. We only mutate each app's
             // latestVersion field from here on (never add/remove), so concurrent fetch
-            // threads iterating this list to save is safe.
+            // threads writing their own row back is safe.
             final List<SleepingApp> snapshot = new ArrayList<>(merged.values());
-            AppListStorage.save(this, snapshot);
+            AppRepository.upsertApps(this, snapshot);
 
             // Phase 2 (parallel, on the fetch pool): each app's Play Store lookup is an
             // independent network call, so they run concurrently instead of one-at-a-time.
@@ -181,10 +181,10 @@ public class ScanService extends Service implements UpdateManager.Listener {
                     app.latestVersion =
                             PlayStoreVersionFetcher.fetchLatestVersion(app.packageName, app.currentVersion);
 
-                    // AppListStorage.save is static-synchronized, so concurrent saves from
-                    // different fetch threads are serialized. Save as each result lands so a
-                    // mid-scan process kill loses at most the fetches still in flight.
-                    AppListStorage.save(this, snapshot);
+                    // Write just this app's row as its result lands, so a mid-scan process
+                    // kill loses at most the fetches still in flight - and two fetch threads
+                    // finishing at once no longer rewrite the whole list on top of each other.
+                    AppRepository.upsertApp(this, app);
 
                     int c = done.incrementAndGet();
                     notifyRow(app, "Checked " + c + "/" + total + "...");
@@ -217,9 +217,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
 
     @Override
     public void onAppUpdated(SleepingApp app) {
-        List<SleepingApp> all = AppListStorage.load(this);
-        all.removeIf(a -> a.packageName.equals(app.packageName));
-        AppListStorage.save(this, all);
+        AppRepository.removeApp(this, app.packageName);
         mainHandler.post(() -> {
             if (listener != null) listener.onAppUpdated(app);
         });
