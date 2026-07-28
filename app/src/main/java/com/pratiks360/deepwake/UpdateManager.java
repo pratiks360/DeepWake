@@ -63,16 +63,7 @@ public class UpdateManager {
         List<SleepingApp> stillPending = new ArrayList<>();
         for (SleepingApp app : pending) {
             String installed = getInstalledVersion(app.packageName);
-            boolean updated;
-            if (app.latestVersion != null && !app.latestVersion.isEmpty()
-                    && !app.latestVersion.equals(PlayStoreVersionFetcher.NET_ERROR)
-                    && !app.latestVersion.equals(PlayStoreVersionFetcher.NO_MATCH)) {
-                // we know the target version -> updated when installed reaches it
-                updated = app.latestVersion.equals(installed);
-            } else {
-                // no known target -> updated when installed simply changed from baseline
-                updated = installed != null && !installed.equals(app.currentVersion);
-            }
+            boolean updated = isUpdated(app, installed);
 
             if (updated) {
                 app.currentVersion = installed;
@@ -87,6 +78,23 @@ public class UpdateManager {
         } else {
             handler.postDelayed(() -> verifyPending(stillPending, tryCount + 1), VERIFY_INTERVAL_MS);
         }
+    }
+
+    /**
+     * The installed version moving off the version recorded at scan time is the signal -
+     * Play Store is the only thing updating these apps. Matching the scraped "latest" exactly
+     * is not: the same build is routinely written differently on the listing than in the
+     * package ("8.1.2" vs "8.1.2.4-release"), so that test missed real updates. The scraped
+     * version is only used when there is no baseline to move off. Mirrors
+     * AutoUpdateService.isUpdated, which does the same job for batch runs.
+     */
+    private boolean isUpdated(SleepingApp app, String installed) {
+        if (installed == null) return false;
+        if (app.currentVersion != null && !app.currentVersion.isEmpty()) {
+            return !installed.equals(app.currentVersion);
+        }
+        return PlayStoreVersionFetcher.isUsableVersion(app.latestVersion)
+                && !PlayStoreVersionFetcher.isNewerVersion(app.latestVersion, installed);
     }
 
     private String getInstalledVersion(String packageName) {

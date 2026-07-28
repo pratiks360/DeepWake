@@ -20,6 +20,7 @@ import java.util.regex.Pattern;
  * Failure returns diagnostic markers so the UI shows WHY it failed:
  *   real version (e.g. "2.127.1") -> success
  *   "net-error"                   -> request failed / blocked / no INTERNET
+ *   "not-published"               -> the listing publishes no version ("Varies with device")
  *   "no-match"                    -> page fetched but no version token found (snippet logged)
  */
 public class PlayStoreVersionFetcher {
@@ -28,6 +29,9 @@ public class PlayStoreVersionFetcher {
 
     public static final String NET_ERROR = "net-error";
     public static final String NO_MATCH = "no-match";
+    public static final String NO_VERSION = "not-published";
+    /** Placeholder a row carries between being listed by a scan and its lookup landing. */
+    public static final String CHECKING = "checking...";
 
     // A version-shaped token: 2 to 5 dot-separated numeric groups, e.g. 2.127.1 or 1.2.3.4
     private static final Pattern VERSION_TOKEN =
@@ -37,16 +41,32 @@ public class PlayStoreVersionFetcher {
     private static final Pattern SOFTWARE_VERSION =
             Pattern.compile("\"softwareVersion\"\\s*:\\s*\"([^\"]+)\"");
 
+    // The app-details cluster inside Play Store's embedded data. The published version sits
+    // alone in a triple-nested array immediately before the "requires Android" block:
+    //     [[["2.19.300"]],[[[35]],[[[26,"8.0"]]]]],...,[[null,[null,"<what's new>"]]],...
+    // This is the ONLY authoritative version on the page. Every other version-shaped token
+    // is a per-review tag - the version each reviewer happened to have installed.
+    private static final Pattern DETAILS_VERSION =
+            Pattern.compile("\\[\\[\\[\"([^\"]{1,40})\"\\]\\],\\[\\[\\[");
+    // Same slot without the trailing requirements block, for listings that omit it.
+    private static final Pattern DETAILS_VERSION_LOOSE =
+            Pattern.compile("\\[\\[\\[\"([^\"]{1,40})\"\\]\\]");
+    // Same slot, explicitly empty: the app ships per-device builds and Play Store publishes
+    // no single version for it (the listing shows "Varies with device").
+    private static final Pattern DETAILS_NO_VERSION =
+            Pattern.compile("\\[\\[null,\\[\\]\\],\\[\\[\\[");
+
     // Anchors that Play Store places NEAR the current version in the data arrays.
     private static final String[] ANCHORS = {
             "Varies with device", "Version", "Current Version", "Updated on", "What's New", "New features"
     };
 
     /**
-     * @param currentVersion the installed version, used to disambiguate noisy candidates -
-     *                       pass "" if unknown.
+     * The version Play Store publishes for this package, or one of the markers above. Takes
+     * no installed version any more: the old candidate-disambiguation needed it, but the
+     * details slot this reads now is unambiguous.
      */
-    public static String fetchLatestVersion(String packageName, String currentVersion) {
+    public static String fetchLatestVersion(String packageName) {
         String urlStr = "https://play.google.com/store/apps/details?id="
                 + packageName + "&hl=en&gl=US";
         HttpURLConnection conn = null;
@@ -82,26 +102,29 @@ public class PlayStoreVersionFetcher {
                 if (isRealVersion(v)) return v.trim();
             }
 
-            // 2) Look for a version-shaped token NEAR any anchor word (best signal).
-            String best = findNearAnchor(page);
+            // 2) The published version in the app-details cluster - the authoritative one.
+            String best = detailsVersion(page);
             if (best != null) return best;
 
-            // 3) Fallback: Play Store no longer exposes a labeled version field on the
-            //    public listing page. The only version-shaped tokens left on the page are
-            //    the per-review "app version" tags Play Store attaches to each review in
-            //    the reviews carousel (the version the reviewer had installed at the time),
-            //    mixed in with unrelated small numeric tags from the same nested review
-            //    data (rating breakdowns, helpfulness-vote weights, etc). Matching segment
-            //    count alone isn't enough to filter those out - an app whose own version
-            //    happens to be short (e.g. "3.1") collides with unrelated 2-segment noise
-            //    (e.g. "8.0"), so also require the leading segment to match: a real update
-            //    essentially never changes the major version to something unrelated, but an
-            //    unrelated noise tag has no reason to share it. If nothing matches both, we
-            //    have no reliable signal - NO_MATCH is safer than guessing.
-            best = maxVersionToken(page, currentVersion);
+            // 3) The listing says the version varies per device, so there is no single
+            //    "latest" to compare against. Distinct from NO_MATCH: nothing is broken,
+            //    Play Store simply doesn't publish one.
+            if (DETAILS_NO_VERSION.matcher(page).find()) return NO_VERSION;
+
+            // 4) Older/regional markup: a version-shaped token NEAR a label word.
+            best = findNearAnchor(page);
             if (best != null) return best;
 
             // Nothing usable - log a hint around the first anchor so we can refine.
+            //
+            // There used to be a further fallback here that took the highest version-shaped
+            // token anywhere on the page, filtered to the installed version's segment count
+            // and leading segment. Those tokens are the per-review "app version" tags (the
+            // build each reviewer had installed), so the maximum is whatever the most
+            // adventurous reviewer was running - or noise that happens to share the shape.
+            // It reported HDFC Home Loans 5.5 as "latest 5.32" and Tank Stars 2.19.300 as
+            // "latest 2.20.0", both already up to date. A wrong version costs a whole wake +
+            // batch-update cycle chasing an update that doesn't exist, so NO_MATCH it is.
             logHint(packageName, page);
             return NO_MATCH;
 
@@ -133,34 +156,42 @@ public class PlayStoreVersionFetcher {
         return null;
     }
 
-    // Reviewers skew toward whatever version they installed a while ago, so older
-    // releases accumulate far more tagged reviews than the newest one - picking the
-    // most-frequent token (the old strategy) systematically returns a stale version.
-    // The highest version actually seen, restricted to tokens shaped like the installed
-    // version, is a much better lower-bound estimate.
-    private static String maxVersionToken(String page, String currentVersion) {
-        boolean haveCurrent = currentVersion != null && !currentVersion.isEmpty();
-        String[] currentParts = haveCurrent ? currentVersion.split("\\.") : null;
-        int wantSegments = haveCurrent ? currentParts.length : -1;
-        Integer wantLeading = haveCurrent ? parseSegment(currentParts[0]) : null;
-
-        Matcher m = VERSION_TOKEN.matcher(page);
-        String bestMatching = null;
-        String bestAny = null;
-        while (m.find()) {
-            String v = m.group(1);
-            if (!isRealVersion(v)) continue;
-            if (bestAny == null || compareVersions(v, bestAny) > 0) bestAny = v;
-            if (wantSegments > 0) {
-                String[] vParts = v.split("\\.");
-                if (vParts.length == wantSegments && parseSegment(vParts[0]) == wantLeading
-                        && (bestMatching == null || compareVersions(v, bestMatching) > 0)) {
-                    bestMatching = v;
-                }
-            }
+    /**
+     * Reads the published version out of the app-details cluster. The strict form (version
+     * slot followed by the requirements block) is what current listings emit; the loose form
+     * is the same slot without it. Both are validated as version-shaped, which is what keeps
+     * the loose form from picking up the neighbouring string keys.
+     */
+    private static String detailsVersion(String page) {
+        Matcher strict = DETAILS_VERSION.matcher(page);
+        if (strict.find() && looksLikeVersion(strict.group(1))) return strict.group(1).trim();
+        Matcher loose = DETAILS_VERSION_LOOSE.matcher(page);
+        while (loose.find()) {
+            if (looksLikeVersion(loose.group(1))) return loose.group(1).trim();
         }
-        if (haveCurrent) return bestMatching; // no reliable candidate - NO_MATCH beats a guess
-        return bestAny; // current version unknown - a rough guess is the best available signal
+        return null;
+    }
+
+    /**
+     * Starts with a digit and has at least one dot between digits. Looser than isRealVersion
+     * on purpose - this only ever sees the details slot, where a build tag like "5.2628.1-hf"
+     * is the real answer, not noise to be filtered.
+     */
+    private static boolean looksLikeVersion(String v) {
+        return v != null && v.matches("^\\d[\\w.-]*\\.[\\w.-]*\\d.*");
+    }
+
+    /**
+     * True when the stored value is a version that can actually be compared, as opposed to a
+     * placeholder or one of the failure markers. Every caller that reasons about versions
+     * goes through here - a missed marker check reads "net-error" as a version number.
+     */
+    public static boolean isUsableVersion(String version) {
+        return version != null && !version.isEmpty()
+                && !version.equals(CHECKING)
+                && !version.equals(NET_ERROR)
+                && !version.equals(NO_MATCH)
+                && !version.equals(NO_VERSION);
     }
 
     /** True if latest is a strictly newer version than current (numeric, not lexicographic). */
