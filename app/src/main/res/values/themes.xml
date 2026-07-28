@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Material 3, following the system light/dark setting. The colour scheme is left at the
+      M3 baseline rather than hand-picked: MainActivity applies dynamic colour where the
+      platform supports it (Android 12+), so on most devices the app takes the user's
+      wallpaper palette, and the baseline is the fallback everywhere else. Hand-rolled
+      colours would fight both.
+    -->
+    <style name="Theme.DeepWake" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">?attr/colorSurface</item>
+        <item name="android:navigationBarColor">?attr/colorSurface</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">?attr/isLightTheme</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">?attr/isLightTheme</item>
+    </style>
+
+</resources>

@@ -7,6 +7,8 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -170,6 +172,11 @@ public class AutoUpdateService extends AccessibilityService {
     // Last tap per Play Store row label, so a row's "Update" isn't re-tapped every poll
     // while the UI catches up.
     private final Map<String, Long> lastRowClick = new HashMap<>();
+    // Why an app didn't make it, keyed by package - recorded at the moment we learn it
+    // (the batch timed out, Play Store never listed it, the version check couldn't reach
+    // the store) and read back when the report is written, so a report says what went
+    // wrong rather than just that something did.
+    private final Map<String, String> failureReasons = new HashMap<>();
     private int totalSelected;
     private int batchNumber;      // 1-based, for the overlay status
     private int updatedCount;
@@ -239,6 +246,7 @@ public class AutoUpdateService extends AccessibilityService {
         verified.clear();
         verifyInFlight.clear();
         lastRowClick.clear();
+        failureReasons.clear();
         deferred.clear();
         queue.clear();
         queue.addAll(apps);
@@ -342,6 +350,11 @@ public class AutoUpdateService extends AccessibilityService {
         boolean stalled = !busy && (tick - lastProgressTick) >= STALL_TICKS && allAwake()
                 && wakeCyclesThisBatch > 0;
         if (tick + 1 >= BATCH_MAX_TICKS || stalled) {
+            String reason = stalled
+                    ? "Play Store made no progress on it for "
+                            + minutes(STALL_TICKS) + " min"
+                    : "its batch hit the " + minutes(BATCH_MAX_TICKS) + " min limit";
+            for (SleepingApp app : pending) failureReasons.put(app.packageName, reason);
             deferred.addAll(pending);   // keep watching them; the run reports on them at the end
             pending.clear();
             startNextBatch();
@@ -457,7 +470,8 @@ public class AutoUpdateService extends AccessibilityService {
             // Verified: Play Store really does have something newer (or we couldn't tell).
             // Give it the rest of its budget, then stop.
             if (attempts >= MAX_WAKE_ATTEMPTS) {
-                markFailed(app);
+                markFailed(app, "Play Store never offered the update - woken "
+                        + attempts + " times");
                 it.remove();
             }
         }
@@ -484,7 +498,14 @@ public class AutoUpdateService extends AccessibilityService {
         verified.add(app.packageName);
 
         if (!PlayStoreVersionFetcher.isUsableVersion(latest)) {
-            return; // can't tell - the retry budget still applies
+            // Can't tell whether an update exists - the retry budget still applies, but
+            // remember why, so the report doesn't blame Play Store for not listing an app
+            // when the real problem was the check itself.
+            failureReasons.put(app.packageName,
+                    PlayStoreVersionFetcher.NET_ERROR.equals(latest)
+                            ? "couldn't reach Play Store to check its version"
+                            : "Play Store publishes no version for it");
+            return;
         }
 
         app.latestVersion = latest; // keep the fresh value for isUpdated / the app list
@@ -502,10 +523,19 @@ public class AutoUpdateService extends AccessibilityService {
         return n == null ? 0 : n;
     }
 
-    /** Out of retries with a genuinely newer version still on the store - report it as failed. */
-    private void markFailed(SleepingApp app) {
+    /**
+     * Out of retries with a genuinely newer version still on the store. The reason recorded
+     * while chasing the app (if any) wins over the caller's - it's the more specific one.
+     */
+    private void markFailed(SleepingApp app, String reason) {
+        String recorded = failureReasons.get(app.packageName);
         reportItems.add(new BatchReport.Item(app.appName, app.packageName,
-                BatchReport.STATUS_FAILED, "Play Store never listed it"));
+                BatchReport.STATUS_FAILED, recorded != null ? recorded : reason));
+    }
+
+    /** Tick counts read as minutes, for reasons a person has to make sense of. */
+    private int minutes(int ticks) {
+        return Math.max(1, Math.round(ticks * VERIFY_INTERVAL_MS / 60000f));
     }
 
     /**
@@ -693,12 +723,29 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void finishFlow() {
+        finishFlow(null);
+    }
+
+    /**
+     * @param cancelReason set when the run was stopped early, so every app still outstanding
+     *                     says so instead of carrying whatever reason it had at the time.
+     */
+    private void finishFlow(String cancelReason) {
         // Normal finish happens with every list empty, but the drain's time cap - or a mid-run
         // stop - can leave apps behind; those are recorded as still pending, not as failures,
         // since Play Store may well finish them minutes later.
-        for (SleepingApp app : deferred) addPending(app, "still installing");
-        for (SleepingApp app : pending) addPending(app, "not reached");
-        for (SleepingApp app : queue) addPending(app, "not reached");
+        for (SleepingApp app : deferred) {
+            addPending(app, cancelReason != null ? cancelReason
+                    : reasonFor(app, "still installing when the run ended"));
+        }
+        for (SleepingApp app : pending) {
+            addPending(app, cancelReason != null ? cancelReason
+                    : reasonFor(app, "the run ended while its batch was still going"));
+        }
+        for (SleepingApp app : queue) {
+            addPending(app, cancelReason != null ? cancelReason
+                    : "the run ended before its batch started");
+        }
         int outstanding = 0;
         for (BatchReport.Item item : reportItems) {
             if (!BatchReport.STATUS_UPDATED.equals(item.status)
@@ -707,7 +754,8 @@ public class AutoUpdateService extends AccessibilityService {
             }
         }
         stopFlowInternal();
-        Toast.makeText(this, "Batch update finished: " + updatedCount + " updated"
+        Toast.makeText(this, (cancelReason == null ? "Batch update finished: " : "Cancelled: ")
+                + updatedCount + " updated"
                 + (outstanding > 0 ? ", " + outstanding + " still pending" : ""),
                 Toast.LENGTH_LONG).show();
 
@@ -724,8 +772,22 @@ public class AutoUpdateService extends AccessibilityService {
                 BatchReport.STATUS_PENDING, detail));
     }
 
+    private String reasonFor(SleepingApp app, String fallback) {
+        String recorded = failureReasons.get(app.packageName);
+        return recorded != null ? recorded : fallback;
+    }
+
+    /**
+     * The user hit Cancel. That's still a run worth recording - it's the case where knowing
+     * what had and hadn't happened matters most - so it lands in the history like any other,
+     * with everything outstanding marked as cancelled.
+     */
     private void cancelFlow(boolean returnToApp) {
         if (!running && overlay == null) return;
+        if (running && returnToApp) {
+            finishFlow("run cancelled");
+            return;
+        }
         stopFlowInternal();
         if (returnToApp) bringDeepWakeToFront(new Intent(this, MainActivity.class));
     }
@@ -1165,44 +1227,79 @@ public class AutoUpdateService extends AccessibilityService {
         try {
             windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-            LinearLayout box = new LinearLayout(this);
-            box.setOrientation(LinearLayout.VERTICAL);
-            box.setGravity(Gravity.CENTER);
-            box.setBackgroundColor(Color.parseColor("#A6000000"));
-            int pad = (int) (24 * getResources().getDisplayMetrics().density);
-            box.setPadding(pad, pad, pad, pad);
+            // Scrim + a rounded card, rather than one flat tinted box. Colours are literals
+            // here on purpose: this is a service window with no activity theme behind it, so
+            // there are no theme attributes to resolve. It sits over Play Store, which is
+            // dark on most devices, so the card is dark too.
+            LinearLayout scrim = new LinearLayout(this);
+            scrim.setOrientation(LinearLayout.VERTICAL);
+            scrim.setGravity(Gravity.CENTER);
+            scrim.setBackgroundColor(Color.parseColor("#B3000000"));
             // The layout consumes every touch that lands on it, which is exactly what
             // blocks the user's input to whatever is underneath while the flow runs.
-            box.setClickable(true);
+            scrim.setClickable(true);
+
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setGravity(Gravity.CENTER);
+            GradientDrawable cardBg = new GradientDrawable();
+            cardBg.setColor(Color.parseColor("#1C1B1F"));
+            cardBg.setCornerRadius(dp(28));
+            card.setBackground(cardBg);
+            card.setPadding(dp(28), dp(28), dp(28), dp(24));
+            LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            cardLp.setMargins(dp(24), 0, dp(24), 0);
+            card.setLayoutParams(cardLp);
 
             // Indeterminate spinner - a live "working" animation for the whole run.
             ProgressBar spinner = new ProgressBar(this);
             spinner.setIndeterminate(true);
+            if (spinner.getIndeterminateDrawable() != null) {
+                spinner.getIndeterminateDrawable().setColorFilter(
+                        Color.parseColor("#D0BCFF"), PorterDuff.Mode.SRC_IN);
+            }
             LinearLayout.LayoutParams spinnerLp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            spinnerLp.bottomMargin = pad;
+                    dp(40), dp(40));
+            spinnerLp.bottomMargin = dp(20);
             spinner.setLayoutParams(spinnerLp);
-            box.addView(spinner);
+            card.addView(spinner);
 
             overlayStatus = new TextView(this);
-            overlayStatus.setTextColor(Color.WHITE);
-            overlayStatus.setTextSize(18);
+            overlayStatus.setTextColor(Color.parseColor("#E6E1E5"));
+            overlayStatus.setTextSize(17);
+            overlayStatus.setLineSpacing(dp(3), 1f);
             overlayStatus.setGravity(Gravity.CENTER);
             overlayStatus.setText("DeepWake is updating your apps...\nPlease don't touch the screen.");
-            box.addView(overlayStatus);
+            card.addView(overlayStatus);
 
             TextView hint = new TextView(this);
-            hint.setTextColor(Color.parseColor("#BBBBBB"));
+            hint.setTextColor(Color.parseColor("#938F99"));
             hint.setTextSize(13);
             hint.setGravity(Gravity.CENTER);
-            hint.setPadding(0, pad / 2, 0, pad);
+            hint.setPadding(0, dp(12), 0, dp(24));
             hint.setText("Apps will flash on screen while they are woken.");
-            box.addView(hint);
+            card.addView(hint);
 
             Button cancel = new Button(this);
             cancel.setText("Cancel");
+            cancel.setAllCaps(false);
+            cancel.setTextSize(15);
+            cancel.setTextColor(Color.parseColor("#381E72"));
+            cancel.setStateListAnimator(null);
+            GradientDrawable cancelBg = new GradientDrawable();
+            cancelBg.setColor(Color.parseColor("#D0BCFF"));
+            cancelBg.setCornerRadius(dp(20));
+            cancel.setBackground(cancelBg);
+            LinearLayout.LayoutParams cancelLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(48));
+            cancel.setLayoutParams(cancelLp);
             cancel.setOnClickListener(v -> cancelFlow(true));
-            box.addView(cancel);
+            card.addView(cancel);
+
+            scrim.addView(card);
+            LinearLayout box = scrim;
 
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                     WindowManager.LayoutParams.MATCH_PARENT,
@@ -1244,5 +1341,9 @@ public class AutoUpdateService extends AccessibilityService {
         if (overlayStatus != null) {
             overlayStatus.setText("DeepWake is updating your apps...\n\n" + text);
         }
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }

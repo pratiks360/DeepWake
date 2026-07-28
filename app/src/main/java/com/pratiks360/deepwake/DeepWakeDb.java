@@ -12,6 +12,9 @@ import android.database.sqlite.SQLiteOpenHelper;
  *   apps         - the tracked sleeping apps (one row per package)
  *   reports      - one row per finished batch run, newest 5 kept
  *   report_items - the per-app lines of each report
+ *   excluded     - packages the user never wants touched; kept in its own table so an
+ *                  exclusion outlives the app row it was made from (rows come and go as
+ *                  apps update), and so a scan can skip the package before doing any work
  *
  * Plain SQLiteOpenHelper rather than Room: the schema is three flat tables with no
  * relations worth modelling, and this keeps the build free of annotation processing.
@@ -20,7 +23,7 @@ import android.database.sqlite.SQLiteOpenHelper;
 public class DeepWakeDb extends SQLiteOpenHelper {
 
     private static final String NAME = "deepwake.db";
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;   // 2: added the excluded table
 
     static final String T_APPS = "apps";
     static final String C_PACKAGE = "package_name";
@@ -39,6 +42,9 @@ public class DeepWakeDb extends SQLiteOpenHelper {
     static final String C_REPORT_ID = "report_id";
     static final String C_STATUS = "status";
     static final String C_DETAIL = "detail";
+
+    static final String T_EXCLUDED = "excluded";
+    static final String C_EXCLUDED_AT = "excluded_at";
 
     private static DeepWakeDb instance;
 
@@ -78,11 +84,21 @@ public class DeepWakeDb extends SQLiteOpenHelper {
                 + C_DETAIL + " TEXT NOT NULL DEFAULT '')");
         db.execSQL("CREATE INDEX idx_report_items_report ON "
                 + T_REPORT_ITEMS + "(" + C_REPORT_ID + ")");
+
+        createExcluded(db);
     }
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        // No shipped schema older than v1 exists yet; when one does, migrate here rather
-        // than dropping - the tracked list is expensive to rebuild (a full Play Store scan).
+        // Migrate, never drop - the tracked list is expensive to rebuild (a full scan plus
+        // a Play Store lookup per app).
+        if (oldVersion < 2) createExcluded(db);
+    }
+
+    private void createExcluded(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE " + T_EXCLUDED + " ("
+                + C_PACKAGE + " TEXT PRIMARY KEY, "
+                + C_APP_NAME + " TEXT NOT NULL, "
+                + C_EXCLUDED_AT + " INTEGER NOT NULL DEFAULT 0)");
     }
 }

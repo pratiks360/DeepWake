@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dark-theme counterparts; see the comment in values/colors.xml. -->
+<resources>
+    <color name="version_outdated">#F2B8B5</color>
+    <color name="version_muted">#CAC4D0</color>
+</resources>
