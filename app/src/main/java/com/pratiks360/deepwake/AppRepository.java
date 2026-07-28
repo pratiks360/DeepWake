@@ -12,7 +12,9 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Every read/write of persisted state goes through here - the tracked sleeping apps and the
@@ -92,6 +94,61 @@ public class AppRepository {
         v.put(DeepWakeDb.C_LATEST_VERSION, app.latestVersion == null ? "" : app.latestVersion);
         v.put(DeepWakeDb.C_UPDATED_AT, System.currentTimeMillis());
         return v;
+    }
+
+    // ---------------------------------------------------------------- exclusions
+
+    /**
+     * Never touch this app again: it stops being tracked now, and scans skip the package
+     * outright from here on (no Play Store lookup, no row, no place in a batch).
+     */
+    public static void excludeApp(Context context, String packageName, String appName) {
+        migrateLegacyJson(context);
+        SQLiteDatabase db = DeepWakeDb.get(context).getWritableDatabase();
+        db.beginTransaction();
+        try {
+            ContentValues v = new ContentValues();
+            v.put(DeepWakeDb.C_PACKAGE, packageName);
+            v.put(DeepWakeDb.C_APP_NAME, appName == null || appName.isEmpty()
+                    ? packageName : appName);
+            v.put(DeepWakeDb.C_EXCLUDED_AT, System.currentTimeMillis());
+            db.insertWithOnConflict(DeepWakeDb.T_EXCLUDED, null, v,
+                    SQLiteDatabase.CONFLICT_REPLACE);
+            db.delete(DeepWakeDb.T_APPS, DeepWakeDb.C_PACKAGE + " = ?",
+                    new String[]{packageName});
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    /** Undo an exclusion. The app reappears after the next scan, not immediately. */
+    public static void includeApp(Context context, String packageName) {
+        DeepWakeDb.get(context).getWritableDatabase().delete(DeepWakeDb.T_EXCLUDED,
+                DeepWakeDb.C_PACKAGE + " = ?", new String[]{packageName});
+    }
+
+    /** Just the package names - what a scan checks each installed app against. */
+    public static Set<String> excludedPackages(Context context) {
+        Set<String> out = new HashSet<>();
+        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(DeepWakeDb.T_EXCLUDED, new String[]{DeepWakeDb.C_PACKAGE},
+                null, null, null, null, null)) {
+            while (c.moveToNext()) out.add(c.getString(0));
+        }
+        return out;
+    }
+
+    /** The excluded apps with their names, for the "Excluded apps" screen. */
+    public static List<ExcludedApp> loadExcluded(Context context) {
+        List<ExcludedApp> out = new ArrayList<>();
+        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(DeepWakeDb.T_EXCLUDED,
+                new String[]{DeepWakeDb.C_PACKAGE, DeepWakeDb.C_APP_NAME},
+                null, null, null, null, DeepWakeDb.C_APP_NAME + " COLLATE NOCASE ASC")) {
+            while (c.moveToNext()) out.add(new ExcludedApp(c.getString(0), c.getString(1)));
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- run reports

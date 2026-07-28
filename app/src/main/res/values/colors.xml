@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The two colours the app list sets from code. Everything else in the UI takes its colour
+  from theme attributes (?attr/colorOnSurface and friends) straight out of the layouts;
+  these exist because a row's version line switches colour per-app at bind time, and the
+  values-night copy is what keeps that switch readable in dark mode.
+
+  Values are the Material 3 baseline error / on-surface-variant tones.
+-->
+<resources>
+    <color name="version_outdated">#B3261E</color>
+    <color name="version_muted">#49454F</color>
+</resources>

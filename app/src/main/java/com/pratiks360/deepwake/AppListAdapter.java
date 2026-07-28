@@ -1,15 +1,16 @@
 package com.pratiks360.deepwake;
 
-import android.graphics.Color;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.RecyclerView;
+
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.checkbox.MaterialCheckBox;
 
 import java.util.List;
 
@@ -19,14 +20,21 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         void onUpdateClick(SleepingApp app);
     }
 
+    /** Long-press: the row offers to stop tracking this app for good. */
+    public interface OnExcludeListener {
+        void onExcludeRequested(SleepingApp app);
+    }
+
     private final List<SleepingApp> items;
     private final OnUpdateClickListener listener;
+    private final OnExcludeListener excludeListener;
     private final Runnable onSelectionChanged;
 
     public AppListAdapter(List<SleepingApp> items, OnUpdateClickListener listener,
-                          Runnable onSelectionChanged) {
+                          OnExcludeListener excludeListener, Runnable onSelectionChanged) {
         this.items = items;
         this.listener = listener;
+        this.excludeListener = excludeListener;
         this.onSelectionChanged = onSelectionChanged;
     }
 
@@ -41,37 +49,35 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
     public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
         SleepingApp app = items.get(position);
         holder.name.setText(app.appName);
-        holder.currentVersion.setText("Current: " + (app.currentVersion.isEmpty() ? "?" : app.currentVersion));
 
+        String current = app.currentVersion.isEmpty() ? "?" : app.currentVersion;
         String latest = app.latestVersion == null ? "" : app.latestVersion;
-        String latestLabel;
+        String versionLine;
         boolean outdated = false;
-        boolean enableBtn = false;
 
         if (latest.equals(PlayStoreVersionFetcher.CHECKING)) {
-            latestLabel = "Latest: checking...";
-        } else if (latest.isEmpty() || latest.equals(PlayStoreVersionFetcher.NO_MATCH)) {
-            latestLabel = "Latest: unknown (couldn't read Play Store)";
+            versionLine = current + "  ·  checking Play Store…";
         } else if (latest.equals(PlayStoreVersionFetcher.NO_VERSION)) {
             // Play Store ships this app per-device and publishes no version for it, so
             // there is nothing to compare against - not a failure on our side.
-            latestLabel = "Latest: varies with device";
+            versionLine = current + "  ·  version varies with device";
         } else if (latest.equals(PlayStoreVersionFetcher.NET_ERROR)) {
-            latestLabel = "Latest: unavailable (network)";
+            versionLine = current + "  ·  Play Store unreachable";
+        } else if (!PlayStoreVersionFetcher.isUsableVersion(latest)) {
+            versionLine = current + "  ·  latest unknown";
         } else {
-            latestLabel = "Latest: " + latest;
             outdated = PlayStoreVersionFetcher.isNewerVersion(latest, app.currentVersion);
-            enableBtn = outdated;
-        }
-        holder.latestVersion.setText(latestLabel);
-
-        if (outdated) {
-            holder.latestVersion.setTextColor(Color.parseColor("#D32F2F"));
-        } else {
-            holder.latestVersion.setTextColor(Color.parseColor("#388E3C"));
+            versionLine = outdated ? current + "  →  " + latest : current + "  ·  up to date";
         }
 
-        holder.btnUpdate.setEnabled(enableBtn);
+        holder.versionLine.setText(versionLine);
+        // Own colour resources rather than a library R.attr lookup: with non-transitive R
+        // classes there is no promise about which library's R carries a given attr, and
+        // values-night gives the dark-mode variant anyway.
+        holder.versionLine.setTextColor(ContextCompat.getColor(holder.itemView.getContext(),
+                outdated ? R.color.version_outdated : R.color.version_muted));
+
+        holder.btnUpdate.setEnabled(outdated);
         holder.btnUpdate.setOnClickListener(v -> listener.onUpdateClick(app));
 
         // Recycled rows keep their old listener - detach it before setChecked, or binding
@@ -86,6 +92,10 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
         // Tapping anywhere on the row toggles selection (the Update button has its own
         // click handler and swallows the touch, so it won't also flip the checkbox).
         holder.itemView.setOnClickListener(v -> holder.cbSelect.toggle());
+        holder.itemView.setOnLongClickListener(v -> {
+            if (excludeListener != null) excludeListener.onExcludeRequested(app);
+            return true;
+        });
     }
 
     @Override
@@ -94,15 +104,14 @@ public class AppListAdapter extends RecyclerView.Adapter<AppListAdapter.ViewHold
     }
 
     static class ViewHolder extends RecyclerView.ViewHolder {
-        TextView name, currentVersion, latestVersion;
-        Button btnUpdate;
-        CheckBox cbSelect;
+        TextView name, versionLine;
+        MaterialButton btnUpdate;
+        MaterialCheckBox cbSelect;
 
         ViewHolder(View itemView) {
             super(itemView);
             name = itemView.findViewById(R.id.appName);
-            currentVersion = itemView.findViewById(R.id.currentVersion);
-            latestVersion = itemView.findViewById(R.id.latestVersion);
+            versionLine = itemView.findViewById(R.id.versionLine);
             btnUpdate = itemView.findViewById(R.id.btnUpdateSingle);
             cbSelect = itemView.findViewById(R.id.cbSelect);
         }

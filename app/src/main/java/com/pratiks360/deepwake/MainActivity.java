@@ -1,8 +1,6 @@
 package com.pratiks360.deepwake;
 
 import android.Manifest;
-import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -13,22 +11,30 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.provider.Settings;
-import android.widget.Button;
-import android.widget.CheckBox;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
+
+import com.google.android.material.appbar.MaterialToolbar;
+import com.google.android.material.button.MaterialButton;
+import com.google.android.material.checkbox.MaterialCheckBox;
+import com.google.android.material.color.DynamicColors;
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-public class MainActivity extends Activity implements ScanService.Listener {
+public class MainActivity extends AppCompatActivity implements ScanService.Listener {
 
     // Only outdated (or still-being-checked) apps are shown - sleeping apps that are
     // already current aren't actionable, so there's no point cluttering the list with them.
@@ -36,12 +42,14 @@ public class MainActivity extends Activity implements ScanService.Listener {
     private final Set<String> trackedPackages = new HashSet<>();
     private AppListAdapter adapter;
     private RecyclerView recyclerView;
-    private Button btnScan, btnUpdateAll, btnReports;
-    private CheckBox cbSelectAll;
-    private TextView statusText;
+    private MaterialButton btnScan, btnUpdateAll;
+    private MaterialCheckBox cbSelectAll;
+    private TextView statusText, statusHeadline;
+    private View emptyState;
 
     private ScanService scanService;
     private boolean bound;
+    private boolean scanning;
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
@@ -60,20 +68,27 @@ public class MainActivity extends Activity implements ScanService.Listener {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Android 12+ recolours the app from the user's wallpaper; older versions keep the
+        // Material 3 baseline. Must run before setContentView.
+        DynamicColors.applyToActivityIfAvailable(this);
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        MaterialToolbar toolbar = findViewById(R.id.toolbar);
+        setSupportActionBar(toolbar);
+
         btnScan = findViewById(R.id.btnScan);
         btnUpdateAll = findViewById(R.id.btnUpdateAll);
-        btnReports = findViewById(R.id.btnReports);
         cbSelectAll = findViewById(R.id.cbSelectAll);
         statusText = findViewById(R.id.statusText);
+        statusHeadline = findViewById(R.id.statusHeadline);
+        emptyState = findViewById(R.id.emptyState);
 
         recyclerView = findViewById(R.id.recyclerView);
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         adapter = new AppListAdapter(appList, app -> {
             if (scanService != null) scanService.startUpdateSingle(app);
-        }, this::updateSelectionCount);
+        }, this::confirmExclude, this::updateSelectionCount);
         recyclerView.setAdapter(adapter);
 
         reloadFromStorage();
@@ -114,9 +129,28 @@ public class MainActivity extends Activity implements ScanService.Listener {
             }
             svc.startBatchUpdate(selected);
         });
-        btnReports.setOnClickListener(v -> showReportHistory());
 
         maybeShowBatchReport(getIntent());
+    }
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        getMenuInflater().inflate(R.menu.main_menu, menu);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        int id = item.getItemId();
+        if (id == R.id.menu_reports) {
+            showReportHistory();
+            return true;
+        }
+        if (id == R.id.menu_excluded) {
+            showExcludedApps();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
     }
 
     @Override
@@ -156,7 +190,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
         }
         CharSequence[] rows = new CharSequence[reports.size()];
         for (int i = 0; i < reports.size(); i++) rows[i] = reports.get(i).rowLabel();
-        new AlertDialog.Builder(this)
+        new MaterialAlertDialogBuilder(this)
                 .setTitle("Recent update runs")
                 .setItems(rows, (d, which) -> showReport(reports.get(which)))
                 .setNegativeButton("Close", null)
@@ -164,11 +198,64 @@ public class MainActivity extends Activity implements ScanService.Listener {
     }
 
     private void showReport(BatchReport report) {
-        new AlertDialog.Builder(this)
+        new MaterialAlertDialogBuilder(this)
                 .setTitle(report.title())
                 .setMessage(report.body())
-                .setPositiveButton("OK", null)
-                .setNeutralButton("All reports", (d, w) -> showReportHistory())
+                .setPositiveButton("Done", null)
+                .setNeutralButton("All runs", (d, w) -> showReportHistory())
+                .show();
+    }
+
+    /**
+     * Long-press on a row. Excluding is deliberately a confirmed action rather than a swipe:
+     * it's sticky, and it takes the app out of scanning entirely, so an accidental one would
+     * quietly stop DeepWake from ever looking at that app again.
+     */
+    private void confirmExclude(SleepingApp app) {
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("Exclude " + app.appName + "?")
+                .setMessage("DeepWake will stop tracking it and skip it on every scan from "
+                        + "now on. You can undo this from \"Excluded apps\" in the menu.")
+                .setPositiveButton("Exclude", (d, w) -> {
+                    AppRepository.excludeApp(this, app.packageName, app.appName);
+                    trackedPackages.remove(app.packageName);
+                    removeRow(app.packageName);
+                    updateStatus();
+                    Toast.makeText(this, app.appName + " excluded", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** The exclusion list, with a tick against each app to bring back. */
+    private void showExcludedApps() {
+        List<ExcludedApp> excluded = AppRepository.loadExcluded(this);
+        if (excluded.isEmpty()) {
+            Toast.makeText(this, "No apps are excluded. Long-press an app to exclude it.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        CharSequence[] names = new CharSequence[excluded.size()];
+        boolean[] restore = new boolean[excluded.size()];
+        for (int i = 0; i < excluded.size(); i++) names[i] = excluded.get(i).appName;
+
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("Excluded apps (" + excluded.size() + ")")
+                .setMultiChoiceItems(names, restore, (d, which, checked) -> restore[which] = checked)
+                .setPositiveButton("Stop excluding", (d, w) -> {
+                    int count = 0;
+                    for (int i = 0; i < excluded.size(); i++) {
+                        if (!restore[i]) continue;
+                        AppRepository.includeApp(this, excluded.get(i).packageName);
+                        count++;
+                    }
+                    if (count > 0) {
+                        // They only come back as rows once a scan has looked them up again.
+                        Toast.makeText(this, count + " app(s) restored - run a scan to "
+                                + "pick them up", Toast.LENGTH_LONG).show();
+                    }
+                })
+                .setNegativeButton("Close", null)
                 .show();
     }
 
@@ -178,7 +265,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
      * "go flip the switch" instructions dead-end. Walk the user through the unblock too.
      */
     private void showAccessibilityHelpDialog() {
-        new AlertDialog.Builder(this)
+        new MaterialAlertDialogBuilder(this)
                 .setTitle("Enable the DeepWake service")
                 .setMessage("Automatic batch updates need DeepWake's accessibility service.\n\n"
                         + "1. Open Accessibility settings\n"
@@ -252,19 +339,34 @@ public class MainActivity extends Activity implements ScanService.Listener {
     private void updateStatus() {
         int outdated = 0;
         for (SleepingApp a : appList) if (isOutdated(a)) outdated++;
-        statusText.setText(outdated + " outdated / " + trackedPackages.size() + " sleeping tracked");
+        statusHeadline.setText(outdated == 0
+                ? getString(R.string.dash)
+                : String.valueOf(outdated));
+        statusText.setText(outdated == 0
+                ? trackedPackages.size() + " sleeping apps tracked, none outdated"
+                : (outdated == 1 ? "app to update" : "apps to update")
+                        + " · " + trackedPackages.size() + " sleeping apps tracked");
+        // The empty state replaces the list, not the summary - the counts still matter.
+        // Not while a scan is running, though: rows stream in one at a time, and "Nothing to
+        // update" on top of a scan that hasn't finished is just wrong.
+        boolean empty = appList.isEmpty() && !scanning;
+        if (emptyState != null) emptyState.setVisibility(empty ? View.VISIBLE : View.GONE);
+        if (recyclerView != null) recyclerView.setVisibility(empty ? View.GONE : View.VISIBLE);
         updateSelectionCount();
     }
 
     /** Keeps the Update button showing how many apps are currently ticked. */
     private void updateSelectionCount() {
         int count = selectedOutdated().size();
-        btnUpdateAll.setText(count > 0 ? "Update Selected (" + count + ")" : "Update Selected");
+        btnUpdateAll.setText(count > 0 ? "Update (" + count + ")" : "Update");
+        btnUpdateAll.setEnabled(count > 0);
     }
 
     private void setScanning(boolean scanning) {
+        this.scanning = scanning;
         btnScan.setEnabled(!scanning);
-        btnScan.setText(scanning ? "Scanning..." : "Scan for updates");
+        btnScan.setText(scanning ? R.string.action_scanning : R.string.action_scan);
+        updateStatus();
     }
 
     private void addOrUpdateRow(SleepingApp app) {
@@ -297,7 +399,7 @@ public class MainActivity extends Activity implements ScanService.Listener {
     @Override
     public void onRowUpdated(SleepingApp app) {
         trackedPackages.add(app.packageName);
-        boolean checking = "checking...".equals(app.latestVersion);
+        boolean checking = PlayStoreVersionFetcher.CHECKING.equals(app.latestVersion);
         if (checking || isOutdated(app)) {
             addOrUpdateRow(app);
         } else {

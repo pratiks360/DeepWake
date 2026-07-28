@@ -76,16 +76,17 @@ public class BatchReport {
             sb.append("Updated (").append(done.size()).append("):\n");
             for (Item item : done) {
                 sb.append(item.bullet()).append(item.appName);
-                if (!item.detail.isEmpty()) sb.append(" (").append(item.detail).append(")");
+                if (!item.detail.isEmpty()) sb.append("  ").append(item.detail);
                 sb.append("\n");
             }
         }
         if (!outstanding.isEmpty()) {
+            // The reason goes on its own indented line - these are sentences, not version
+            // numbers, and a report nobody can read is a report that doesn't get read.
             sb.append("\nNot updated (").append(outstanding.size()).append("):\n");
             for (Item item : outstanding) {
-                sb.append(item.bullet()).append(item.appName);
-                if (!item.detail.isEmpty()) sb.append(" (").append(item.detail).append(")");
-                sb.append("\n");
+                sb.append(item.bullet()).append(item.appName).append("\n");
+                if (!item.detail.isEmpty()) sb.append("      ").append(item.detail).append("\n");
             }
         }
         return sb.toString().trim();

@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -129,14 +130,22 @@ public class ScanService extends Service implements UpdateManager.Listener {
             // Phase 1 (fast, on this control thread): enumerate the sleeping apps and show
             // every row up front as "checking...". No network here, so it returns quickly.
             // preserve any previously tracked entries not re-encountered this scan
+            // Excluded packages are dropped before anything costs anything - no row, no
+            // Play Store lookup, no place in a batch. The filter is applied to the stored
+            // list too, so an app excluded while a scan was running doesn't linger.
+            Set<String> excluded = AppRepository.excludedPackages(this);
+
             Map<String, SleepingApp> merged = new LinkedHashMap<>();
-            for (SleepingApp a : AppRepository.loadApps(this)) merged.put(a.packageName, a);
+            for (SleepingApp a : AppRepository.loadApps(this)) {
+                if (!excluded.contains(a.packageName)) merged.put(a.packageName, a);
+            }
 
             List<SleepingApp> toFetch = new ArrayList<>();
             for (ApplicationInfo info : pm.getInstalledApplications(0)) {
                 if (!scanning) break;
                 if ((info.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
                 if (info.enabled) continue; // only deep-sleeping (disabled) apps
+                if (excluded.contains(info.packageName)) continue;
                 String installer;
                 try {
                     installer = pm.getInstallerPackageName(info.packageName);
