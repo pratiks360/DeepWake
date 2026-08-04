@@ -140,19 +140,17 @@ public class ScanService extends Service implements UpdateManager.Listener {
                 if (!excluded.contains(a.packageName)) merged.put(a.packageName, a);
             }
 
+            // What counts as "an app the user has" - see Packages.launchable(). Everything
+            // outside this set is an OS service or a headless component, never something
+            // with an update to chase.
+            Set<String> launchable = Packages.launchable(pm);
+
             List<SleepingApp> toFetch = new ArrayList<>();
-            for (ApplicationInfo info : pm.getInstalledApplications(0)) {
+            for (ApplicationInfo info : pm.getInstalledApplications(Packages.MATCH_SLEEPING)) {
                 if (!scanning) break;
-                if ((info.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue;
                 if (info.enabled) continue; // only deep-sleeping (disabled) apps
                 if (excluded.contains(info.packageName)) continue;
-                String installer;
-                try {
-                    installer = pm.getInstallerPackageName(info.packageName);
-                } catch (Exception e) {
-                    installer = null;
-                }
-                if (!"com.android.vending".equals(installer)) continue;
+                if (!launchable.contains(info.packageName)) continue;
 
                 String current = getInstalledVersion(pm, info.packageName);
                 String appName = String.valueOf(pm.getApplicationLabel(info));
@@ -256,10 +254,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
     }
 
     private String getInstalledVersion(PackageManager pm, String packageName) {
-        try {
-            return pm.getPackageInfo(packageName, 0).versionName;
-        } catch (PackageManager.NameNotFoundException e) {
-            return "";
-        }
+        String version = Packages.installedVersion(pm, packageName);
+        return version == null ? "" : version;
     }
 }

@@ -3,7 +3,6 @@ package com.pratiks360.deepwake;
 import android.accessibilityservice.AccessibilityService;
 import android.app.ActivityManager;
 import android.content.Intent;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
@@ -713,13 +712,7 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private boolean isAsleep(String packageName) {
-        try {
-            // A tracked app that has fallen back into hibernation reports enabled == false
-            // again (the same signal the scan uses to detect sleeping apps in the first place).
-            return !getPackageManager().getApplicationInfo(packageName, 0).enabled;
-        } catch (PackageManager.NameNotFoundException e) {
-            return false;
-        }
+        return Packages.isAsleep(getPackageManager(), packageName);
     }
 
     private void finishFlow() {
@@ -855,12 +848,7 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private String getInstalledVersion(String packageName) {
-        try {
-            PackageInfo pi = getPackageManager().getPackageInfo(packageName, 0);
-            return pi.versionName;
-        } catch (PackageManager.NameNotFoundException e) {
-            return null;
-        }
+        return Packages.installedVersion(getPackageManager(), packageName);
     }
 
     // ---------------------------------------------------------------- activity starts
@@ -874,7 +862,7 @@ public class AutoUpdateService extends AccessibilityService {
     private void launchApp(String packageName) {
         wakeAttempts.put(packageName, attemptsFor(packageName) + 1);
         PackageManager pm = getPackageManager();
-        Intent intent = pm.getLaunchIntentForPackage(packageName);
+        Intent intent = Packages.launchIntent(pm, packageName);
         if (intent != null) {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             try {
