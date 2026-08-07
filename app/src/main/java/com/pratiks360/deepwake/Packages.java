@@ -1,6 +1,7 @@
 package com.pratiks360.deepwake;
 
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -31,6 +32,41 @@ public final class Packages {
             | PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS;
 
     private Packages() {
+    }
+
+    /**
+     * Whether this package is asleep, read from the enabled SETTING rather than from
+     * ApplicationInfo.enabled.
+     *
+     * ApplicationInfo.enabled is not a stable fact about the package - the framework
+     * rewrites it from the flags of the query that produced it:
+     *
+     *     } else if (state.enabled == COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED) {
+     *         ai.enabled = (flags & MATCH_DISABLED_UNTIL_USED_COMPONENTS) != 0;
+     *
+     * So the moment a query asks to SEE hibernated packages, those packages start
+     * reporting themselves as enabled, and any "skip the enabled ones" test throws away
+     * precisely what the match flag was added to surface. The setting has no such
+     * dependency. DEFAULT means nothing has overridden the manifest, so the manifest value
+     * carried on the ApplicationInfo is the answer there.
+     */
+    public static boolean isAsleep(PackageManager pm, ApplicationInfo info) {
+        int state;
+        try {
+            state = pm.getApplicationEnabledSetting(info.packageName);
+        } catch (IllegalArgumentException e) {
+            return false; // package went away mid-scan
+        }
+        switch (state) {
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED:
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER:
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED:
+                return true;
+            case PackageManager.COMPONENT_ENABLED_STATE_ENABLED:
+                return false;
+            default: // COMPONENT_ENABLED_STATE_DEFAULT
+                return !info.enabled;
+        }
     }
 
     /**
@@ -91,13 +127,13 @@ public final class Packages {
     }
 
     /**
-     * Whether the app is currently sleeping. A package that has fallen back into hibernation
-     * reports enabled == false again - the same signal the scan detects it by. A package
+     * Whether the app is currently sleeping, by package name. A package that has fallen back
+     * into hibernation is asleep again - the same signal the scan detects it by. A package
      * that genuinely isn't installed counts as awake: there is nothing left to wake.
      */
     public static boolean isAsleep(PackageManager pm, String packageName) {
         try {
-            return !pm.getApplicationInfo(packageName, MATCH_SLEEPING).enabled;
+            return isAsleep(pm, pm.getApplicationInfo(packageName, MATCH_SLEEPING));
         } catch (PackageManager.NameNotFoundException e) {
             return false;
         }
