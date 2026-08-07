@@ -8,6 +8,7 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.PorterDuff;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -98,7 +99,10 @@ public class AutoUpdateService extends AccessibilityService {
     // version is (see resolvePending), and MAX_WAKE_ATTEMPTS is the hard stop after which
     // the app is reported as failed rather than chased for the rest of the batch.
     private static final int VERIFY_AFTER_ATTEMPTS = 2;
-    private static final int MAX_WAKE_ATTEMPTS = 3;
+    private static final int MAX_WAKE_ATTEMPTS = 5;
+    // How long to give the app's own Play Store page to load before reading what it offers.
+    private static final long DETAILS_SETTLE_MS = 2500;
+    private static final int DETAILS_MAX_POLLS = 6;
     // ...but never judge an app while the batch is still visibly progressing: Play Store
     // installs one app at a time, and a batch-wide re-wake cycle bumps every pending app's
     // attempt count at once, so without this an app could be retired mid-download.
@@ -115,6 +119,12 @@ public class AutoUpdateService extends AccessibilityService {
     private static final int MAX_NODES = 900;         // cap on one page-tree snapshot
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
+    // A run is unattended and can last an hour with the screen forced on (KEEP_SCREEN_ON),
+    // so the shade dims the screen right down while it works. Not off: the status and the
+    // Cancel button have to stay findable, and a fully black screen reads as a broken phone.
+    private static final float DIM_BRIGHTNESS = 0.04f;
+    private static final long UNDIM_MS = 10000;       // full brightness after a touch, for this long
+
     // Labels used to drive Play Store's UI. The Downloads screen is the only page with a
     // real "Update all"; the Overview page of "Manage apps and device" carries a row that
     // navigates INTO Downloads, which is where the deep link tends to land instead.
@@ -124,6 +134,10 @@ public class AutoUpdateService extends AccessibilityService {
     private static final String UPDATE_ALL_LABEL = "Update all";
     private static final String UPDATE_LABEL = "Update";
     private static final String CHECK_LABEL = "Check for updates";
+    // An app's own Play Store page has settled once one of these is on it. "Update" there is
+    // Play Store's own answer to whether this device is being offered the update at all.
+    private static final String[] DETAILS_SETTLED_LABELS = {UPDATE_LABEL, "Open", "Uninstall",
+            "Install", "Play"};
     private static final String[] DOWNLOADS_MARKERS =
             {"Downloads", CHECK_LABEL, UPDATE_ALL_LABEL, "Cancel all", "You're ready"};
     private static final String[] DOWNLOADS_ENTRY_LABELS =
@@ -152,6 +166,8 @@ public class AutoUpdateService extends AccessibilityService {
     private WindowManager windowManager;
     private LinearLayout overlay;
     private TextView overlayStatus;
+    private WindowManager.LayoutParams overlayParams; // kept, so brightness can be changed live
+    private final Runnable redim = () -> setOverlayBrightness(DIM_BRIGHTNESS);
 
     // queue holds the selected apps not yet attempted; pending is the CURRENT batch's
     // not-yet-updated apps (at most BATCH_SIZE). All the wake/monitor/re-wake machinery
@@ -167,7 +183,10 @@ public class AutoUpdateService extends AccessibilityService {
     // Play Store, so each app is chased a bounded number of times and verified only once.
     private final Map<String, Integer> wakeAttempts = new HashMap<>();
     private final Set<String> verified = new HashSet<>();
-    private final Set<String> verifyInFlight = new HashSet<>();
+    // Package whose Play Store page is being read right now, or null. Everything else in the
+    // flow holds off while it is set - the drive loop expects the Downloads screen, and a
+    // details page is not it.
+    private String inspecting;
     // Last tap per Play Store row label, so a row's "Update" isn't re-tapped every poll
     // while the UI catches up.
     private final Map<String, Long> lastRowClick = new HashMap<>();
@@ -243,7 +262,7 @@ public class AutoUpdateService extends AccessibilityService {
         reportItems.clear();
         wakeAttempts.clear();
         verified.clear();
-        verifyInFlight.clear();
+        inspecting = null;
         lastRowClick.clear();
         failureReasons.clear();
         deferred.clear();
@@ -327,6 +346,13 @@ public class AutoUpdateService extends AccessibilityService {
 
         if (pending.isEmpty()) {
             startNextBatch();
+            return;
+        }
+
+        if (inspecting != null) {
+            // An app's store page is open and being read. Waking apps, restarting Play Store
+            // or calling the batch stalled underneath that would only interrupt the answer.
+            handler.postDelayed(() -> monitor(tick + 1), VERIFY_INTERVAL_MS);
             return;
         }
 
@@ -445,12 +471,14 @@ public class AutoUpdateService extends AccessibilityService {
      * Enforces the per-app retry budget. When Play Store lists 3 of a batch's 4 apps, the
      * missing one gets woken again by the normal cycles; this decides when to stop chasing:
      *
-     *   after VERIFY_AFTER_ATTEMPTS fruitless wakes -> ask Play Store what the latest
-     *       version actually is (async, see verifyAgainstPlayStore). If it isn't newer than
-     *       what's installed, the app was never really outdated - the stale scraped version
-     *       was - so count it as done instead of chasing it forever.
-     *   at MAX_WAKE_ATTEMPTS with a genuinely newer version available -> report it as
-     *       failed and drop it, so the batch moves on.
+     *   after VERIFY_AFTER_ATTEMPTS fruitless wakes -> open the app's own Play Store page and
+     *       read what it offers (see inspectOnPlayStore). No Update button there means this
+     *       device is not being offered the update at all, so the app stops being chased.
+     *   at MAX_WAKE_ATTEMPTS with Play Store still offering it -> report it as failed and
+     *       drop it, so the batch moves on.
+     *
+     * Only one app is inspected at a time - it takes the screen - so the rest of a batch's
+     * candidates come round on later ticks.
      */
     private void resolvePending(int tick) {
         if (!running) return;
@@ -463,58 +491,119 @@ public class AutoUpdateService extends AccessibilityService {
             int attempts = attemptsFor(app.packageName);
             if (attempts < VERIFY_AFTER_ATTEMPTS) continue;
             if (!verified.contains(app.packageName)) {
-                toVerify.add(app); // resolved on a later tick, once the fetch returns
+                toVerify.add(app); // resolved on a later tick, once the page has been read
                 continue;
             }
-            // Verified: Play Store really does have something newer (or we couldn't tell).
-            // Give it the rest of its budget, then stop.
+            // Checked, and Play Store does offer it (or the page wouldn't load). Give it the
+            // rest of its budget, then stop.
             if (attempts >= MAX_WAKE_ATTEMPTS) {
-                markFailed(app, "Play Store never offered the update - woken "
+                markFailed(app, "Play Store offered it but never started - woken "
                         + attempts + " times");
                 it.remove();
             }
         }
-        for (SleepingApp app : toVerify) verifyAgainstPlayStore(app);
+        if (!toVerify.isEmpty()) inspectOnPlayStore(toVerify.get(0));
     }
 
     /**
-     * Re-fetches the app's Play Store version and compares it with what's installed. The
-     * fetch is network I/O, so it runs off the main thread and lands back on the handler.
+     * Asks Play Store itself, on this device, whether it has an update for the app - by
+     * opening the app's own store page and reading the button on it.
+     *
+     * This replaces a re-fetch of the same scraped web listing the scan uses. That check
+     * could only ever confirm what the scan already believed, which is exactly the wrong
+     * answer for the case it was meant to catch: the published version genuinely IS newer,
+     * but Play Store isn't offering it to THIS device (staged rollout, device or ABI
+     * filtering, or an OEM preload the store won't take over). Reports came back full of
+     * apps chased to their retry limit for an update that was never on offer here.
+     *
+     * The page's own button is the ground truth, and it's actionable: an "Update" there is
+     * tapped on the spot - the surest place to start the install, since it doesn't depend on
+     * the app being listed on Downloads at all.
      */
-    private void verifyAgainstPlayStore(SleepingApp app) {
-        if (!verifyInFlight.add(app.packageName)) return; // already checking this one
-        setOverlayStatus(batchLabel() + "Checking " + app.appName + " against Play Store...");
-        new Thread(() -> {
-            String installed = getInstalledVersion(app.packageName);
-            String latest = PlayStoreVersionFetcher.fetchLatestVersion(app.packageName);
-            handler.post(() -> onVerified(app, installed, latest));
-        }).start();
+    private void inspectOnPlayStore(SleepingApp app) {
+        if (inspecting != null) return; // one at a time; the rest come round on later ticks
+        inspecting = app.packageName;
+        disarmAutoClick(); // no Downloads-page driving while we're on a details page
+        setOverlayStatus(batchLabel() + "Asking Play Store about " + app.appName + "...");
+        Intent details = new Intent(Intent.ACTION_VIEW,
+                Uri.parse("market://details?id=" + app.packageName))
+                .setPackage(PLAY_STORE_PKG)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (!tryStart(details)) {
+            finishInspect(app, false, false);
+            return;
+        }
+        handler.postDelayed(() -> readDetailsPage(app, 0), DETAILS_SETTLE_MS);
     }
 
-    private void onVerified(SleepingApp app, String installed, String latest) {
-        verifyInFlight.remove(app.packageName);
+    private void readDetailsPage(SleepingApp app, int poll) {
+        if (!running) return;
+        AccessibilityNodeInfo root = findPlayStoreRoot();
+        List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+        if (root != null) collectNodes(root, nodes, 0);
+
+        boolean offersUpdate = hasLabel(nodes, UPDATE_LABEL);
+        boolean settled = offersUpdate || hasAnyLabel(nodes, DETAILS_SETTLED_LABELS);
+        if (!settled && poll + 1 < DETAILS_MAX_POLLS) {
+            handler.postDelayed(() -> readDetailsPage(app, poll + 1), POLL_INTERVAL_MS);
+            return;
+        }
+        // An "Update" on this page is worth pressing right here.
+        if (offersUpdate && root != null) clickByLabelDfs(root, UPDATE_LABEL, 0);
+        finishInspect(app, settled, offersUpdate);
+    }
+
+    /**
+     * @param settled      the page loaded far enough to be believed
+     * @param offersUpdate Play Store showed an Update button for this app on this device
+     */
+    private void finishInspect(SleepingApp app, boolean settled, boolean offersUpdate) {
+        inspecting = null;
         if (!running) return;
         verified.add(app.packageName);
 
-        if (!PlayStoreVersionFetcher.isUsableVersion(latest)) {
-            // Can't tell whether an update exists - the retry budget still applies, but
-            // remember why, so the report doesn't blame Play Store for not listing an app
-            // when the real problem was the check itself.
-            failureReasons.put(app.packageName,
-                    PlayStoreVersionFetcher.NET_ERROR.equals(latest)
-                            ? "couldn't reach Play Store to check its version"
-                            : "Play Store publishes no version for it");
-            return;
+        if (!settled) {
+            // Couldn't read the page - the retry budget still applies, but say so, rather
+            // than blaming Play Store for not offering something we never managed to ask about.
+            failureReasons.put(app.packageName, "its Play Store page wouldn't load");
+        } else if (offersUpdate) {
+            // Play Store does have it for this device, and the install has just been started
+            // from the page itself. Give the app its budget back so the batch keeps watching
+            // it rather than retiring it while it downloads.
+            wakeAttempts.put(app.packageName, 0);
+            failureReasons.remove(app.packageName);
+            busyTick = currentTick; // treat this as live work, not a stalled batch
+            setOverlayStatus(batchLabel() + "Updating " + app.appName + " from its store page...");
+        } else {
+            // Play Store has nothing for this device. The app was only ever "outdated"
+            // against the published listing, so stop chasing it - but it stays in the app
+            // list and isn't counted as an update this run performed. It's recorded in the
+            // settled bucket rather than as a failure: nothing failed, there was simply
+            // nothing on offer.
+            if (pending.remove(app)) {
+                reportItems.add(new BatchReport.Item(app.appName, app.packageName,
+                        BatchReport.STATUS_ALREADY_CURRENT,
+                        "Play Store offers no update for this device"));
+            }
         }
 
-        app.latestVersion = latest; // keep the fresh value for isUpdated / the app list
-        if (installed != null && !installed.isEmpty()
-                && !PlayStoreVersionFetcher.isNewerVersion(latest, installed)) {
-            // Nothing newer exists: the installed build IS the current one, so the app was
-            // only ever "outdated" because of a stale scrape. Retire it as done - markUpdated
-            // records it as "already up to date" since its version never moved.
-            if (pending.remove(app)) markUpdated(app);
+        openPlayStoreDownloads();
+        armAutoClick();
+    }
+
+    private boolean hasLabel(List<AccessibilityNodeInfo> nodes, String label) {
+        for (AccessibilityNodeInfo node : nodes) {
+            String found = labelOf(node);
+            if (found != null && found.equalsIgnoreCase(label)) return true;
         }
+        return false;
+    }
+
+    private boolean hasAnyLabel(List<AccessibilityNodeInfo> nodes, String[] labels) {
+        for (String label : labels) {
+            if (hasLabel(nodes, label)) return true;
+        }
+        return false;
     }
 
     private int attemptsFor(String packageName) {
@@ -584,12 +673,12 @@ public class AutoUpdateService extends AccessibilityService {
     private void wakePendingThenReturnToDownloads() {
         disarmAutoClick(); // no Play Store taps while we flip through the apps
         wakeCyclesThisBatch++;
-        wakePendingStep(0);
+        wakePendingStep(pendingWorthWaking(), 0);
     }
 
-    private void wakePendingStep(int i) {
+    private void wakePendingStep(List<SleepingApp> toWake, int i) {
         if (!running) return;
-        if (i >= pending.size()) {
+        if (i >= toWake.size()) {
             handler.postDelayed(() -> {
                 if (!running) return;
                 openPlayStoreDownloads();
@@ -602,8 +691,8 @@ public class AutoUpdateService extends AccessibilityService {
             }, SETTLE_MS);
             return;
         }
-        launchApp(pending.get(i).packageName);
-        handler.postDelayed(() -> wakePendingStep(i + 1), STAGGER_MS);
+        launchApp(toWake.get(i).packageName);
+        handler.postDelayed(() -> wakePendingStep(toWake, i + 1), STAGGER_MS);
     }
 
     /**
@@ -639,11 +728,31 @@ public class AutoUpdateService extends AccessibilityService {
         if ((tick + 1) % REWAKE_EVERY_TICKS != 0) return;
         List<SleepingApp> asleep = new ArrayList<>();
         for (SleepingApp app : pending) {
-            if (isAsleep(app.packageName)) asleep.add(app);
+            if (isAsleep(app.packageName) && worthWaking(app)) asleep.add(app);
         }
         if (asleep.isEmpty()) return; // nothing re-slept; the auto-click poll carries on
         disarmAutoClick(); // don't tap Play Store while we're flipping through the apps
         rewakeStep(asleep, 0);
+    }
+
+    /**
+     * Whether this app is still worth waking. MAX_WAKE_ATTEMPTS used to gate only the moment
+     * an app was written off, not the waking itself - and because retirement waits for the
+     * batch to go quiet (see resolvePending), reports were coming back saying apps had been
+     * "woken 14 times" against a limit of 3. Every wake cycle re-launched every pending app
+     * regardless. Now the budget stops the launches too, so an app Play Store isn't going to
+     * offer stops costing screen flips and time the moment its budget is gone.
+     */
+    private boolean worthWaking(SleepingApp app) {
+        return attemptsFor(app.packageName) < MAX_WAKE_ATTEMPTS;
+    }
+
+    private List<SleepingApp> pendingWorthWaking() {
+        List<SleepingApp> out = new ArrayList<>();
+        for (SleepingApp app : pending) {
+            if (worthWaking(app)) out.add(app);
+        }
+        return out;
     }
 
     private void rewakeStep(List<SleepingApp> asleep, int i) {
@@ -704,9 +813,15 @@ public class AutoUpdateService extends AccessibilityService {
         return false;
     }
 
+    /**
+     * True when nothing is left that waking could still help. An app past its wake budget
+     * counts as awake here whether it is or not: nobody is going to launch it again, so its
+     * sleep state can no longer explain why the batch isn't moving - and leaving it out of
+     * this answer used to hold the batch open to its full 15-minute cap.
+     */
     private boolean allAwake() {
         for (SleepingApp app : pending) {
-            if (isAsleep(app.packageName)) return false;
+            if (worthWaking(app) && isAsleep(app.packageName)) return false;
         }
         return true;
     }
@@ -788,6 +903,7 @@ public class AutoUpdateService extends AccessibilityService {
     private void stopFlowInternal() {
         running = false;
         autoClickArmed = false;
+        inspecting = null;
         handler.removeCallbacksAndMessages(null);
         hideOverlay();
     }
@@ -1226,6 +1342,14 @@ public class AutoUpdateService extends AccessibilityService {
             // The layout consumes every touch that lands on it, which is exactly what
             // blocks the user's input to whatever is underneath while the flow runs.
             scrim.setClickable(true);
+            // A touch anywhere on the scrim brings the screen back up for a while. The run
+            // is dimmed almost to black, and someone who walks over to check on it needs a
+            // way to read the status and find Cancel that isn't guesswork. Children (the
+            // Cancel button) get their own touches, so this doesn't swallow them.
+            scrim.setOnTouchListener((v, event) -> {
+                undimBriefly();
+                return true;
+            });
 
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
@@ -1267,7 +1391,8 @@ public class AutoUpdateService extends AccessibilityService {
             hint.setTextSize(13);
             hint.setGravity(Gravity.CENTER);
             hint.setPadding(0, dp(12), 0, dp(24));
-            hint.setText("Apps will flash on screen while they are woken.");
+            hint.setText("Apps will flash on screen while they are woken.\n"
+                    + "The screen dims while this runs - touch it to see this again.");
             card.addView(hint);
 
             Button cancel = new Button(this);
@@ -1299,8 +1424,17 @@ public class AutoUpdateService extends AccessibilityService {
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSLUCENT);
+            // Dimming is done by the overlay window rather than by writing the system
+            // brightness setting: no WRITE_SETTINGS permission, no value of the user's to
+            // save and put back, and the override dies with the window - so the screen comes
+            // back up on its own when the run ends, and equally if this service is killed or
+            // switched off mid-run. Starts at normal brightness and drops after UNDIM_MS, so
+            // the shade is readable when it appears.
+            lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
             windowManager.addView(box, lp);
             overlay = box;
+            overlayParams = lp;
+            handler.postDelayed(redim, UNDIM_MS);
 
             // Fade + slight scale-up so the shade eases in rather than snapping on.
             box.setAlpha(0f);
@@ -1315,14 +1449,39 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void hideOverlay() {
+        handler.removeCallbacks(redim);
         if (overlay != null && windowManager != null) {
+            // Hand the screen back before the window goes, so the brightness is already up
+            // when the report lands in front of the user. Removing the view would restore it
+            // anyway - this only avoids the flash of a dark report.
+            setOverlayBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
             try {
                 windowManager.removeView(overlay);
             } catch (Exception ignored) {
             }
         }
         overlay = null;
+        overlayParams = null;
         overlayStatus = null;
+    }
+
+    /** Full brightness now, back down to DIM_BRIGHTNESS once the user has stopped touching. */
+    private void undimBriefly() {
+        setOverlayBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
+        handler.removeCallbacks(redim);
+        handler.postDelayed(redim, UNDIM_MS);
+    }
+
+    private void setOverlayBrightness(float brightness) {
+        if (overlay == null || overlayParams == null || windowManager == null) return;
+        if (overlayParams.screenBrightness == brightness) return;
+        overlayParams.screenBrightness = brightness;
+        try {
+            windowManager.updateViewLayout(overlay, overlayParams);
+        } catch (Exception e) {
+            // Same rule as the overlay itself - cosmetic, never worth breaking a run over.
+            Log.w(TAG, "brightness update failed: " + e.getMessage());
+        }
     }
 
     private void setOverlayStatus(String text) {
