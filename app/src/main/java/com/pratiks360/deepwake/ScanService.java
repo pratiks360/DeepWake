@@ -142,15 +142,20 @@ public class ScanService extends Service implements UpdateManager.Listener {
 
             // What counts as "an app the user has" - see Packages.launchable(). Everything
             // outside this set is an OS service or a headless component, never something
-            // with an update to chase.
+            // with an update to chase. An empty result means the query itself didn't work
+            // on this device, not that the user has no apps, so the filter stands down
+            // rather than silently emptying the whole scan.
             Set<String> launchable = Packages.launchable(pm);
+            boolean filterByLauncher = !launchable.isEmpty();
 
             List<SleepingApp> toFetch = new ArrayList<>();
             for (ApplicationInfo info : pm.getInstalledApplications(Packages.MATCH_SLEEPING)) {
                 if (!scanning) break;
-                if (info.enabled) continue; // only deep-sleeping (disabled) apps
+                // Not info.enabled - that field flips to true for hibernated packages once
+                // the query asks to see them. See Packages.isAsleep.
+                if (!Packages.isAsleep(pm, info)) continue;
                 if (excluded.contains(info.packageName)) continue;
-                if (!launchable.contains(info.packageName)) continue;
+                if (filterByLauncher && !launchable.contains(info.packageName)) continue;
 
                 String current = getInstalledVersion(pm, info.packageName);
                 String appName = String.valueOf(pm.getApplicationLabel(info));

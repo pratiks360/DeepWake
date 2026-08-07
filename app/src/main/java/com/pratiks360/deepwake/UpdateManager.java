@@ -2,7 +2,6 @@ package com.pratiks360.deepwake;
 
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -98,17 +97,11 @@ public class UpdateManager {
     }
 
     private String getInstalledVersion(String packageName) {
-        try {
-            PackageInfo pi = context.getPackageManager().getPackageInfo(packageName, 0);
-            return pi.versionName;
-        } catch (PackageManager.NameNotFoundException e) {
-            return null;
-        }
+        return Packages.installedVersion(context.getPackageManager(), packageName);
     }
 
     private void launchApp(String packageName) {
-        PackageManager pm = context.getPackageManager();
-        Intent intent = pm.getLaunchIntentForPackage(packageName);
+        Intent intent = Packages.launchIntent(context.getPackageManager(), packageName);
         if (intent != null) {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             context.startActivity(intent);
