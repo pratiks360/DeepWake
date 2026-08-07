@@ -115,6 +115,12 @@ public class AutoUpdateService extends AccessibilityService {
     private static final int MAX_NODES = 900;         // cap on one page-tree snapshot
     private static final String PLAY_STORE_PKG = "com.android.vending";
 
+    // A run is unattended and can last an hour with the screen forced on (KEEP_SCREEN_ON),
+    // so the shade dims the screen right down while it works. Not off: the status and the
+    // Cancel button have to stay findable, and a fully black screen reads as a broken phone.
+    private static final float DIM_BRIGHTNESS = 0.04f;
+    private static final long UNDIM_MS = 10000;       // full brightness after a touch, for this long
+
     // Labels used to drive Play Store's UI. The Downloads screen is the only page with a
     // real "Update all"; the Overview page of "Manage apps and device" carries a row that
     // navigates INTO Downloads, which is where the deep link tends to land instead.
@@ -152,6 +158,8 @@ public class AutoUpdateService extends AccessibilityService {
     private WindowManager windowManager;
     private LinearLayout overlay;
     private TextView overlayStatus;
+    private WindowManager.LayoutParams overlayParams; // kept, so brightness can be changed live
+    private final Runnable redim = () -> setOverlayBrightness(DIM_BRIGHTNESS);
 
     // queue holds the selected apps not yet attempted; pending is the CURRENT batch's
     // not-yet-updated apps (at most BATCH_SIZE). All the wake/monitor/re-wake machinery
@@ -1226,6 +1234,14 @@ public class AutoUpdateService extends AccessibilityService {
             // The layout consumes every touch that lands on it, which is exactly what
             // blocks the user's input to whatever is underneath while the flow runs.
             scrim.setClickable(true);
+            // A touch anywhere on the scrim brings the screen back up for a while. The run
+            // is dimmed almost to black, and someone who walks over to check on it needs a
+            // way to read the status and find Cancel that isn't guesswork. Children (the
+            // Cancel button) get their own touches, so this doesn't swallow them.
+            scrim.setOnTouchListener((v, event) -> {
+                undimBriefly();
+                return true;
+            });
 
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
@@ -1267,7 +1283,8 @@ public class AutoUpdateService extends AccessibilityService {
             hint.setTextSize(13);
             hint.setGravity(Gravity.CENTER);
             hint.setPadding(0, dp(12), 0, dp(24));
-            hint.setText("Apps will flash on screen while they are woken.");
+            hint.setText("Apps will flash on screen while they are woken.\n"
+                    + "The screen dims while this runs - touch it to see this again.");
             card.addView(hint);
 
             Button cancel = new Button(this);
@@ -1299,8 +1316,17 @@ public class AutoUpdateService extends AccessibilityService {
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                             | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSLUCENT);
+            // Dimming is done by the overlay window rather than by writing the system
+            // brightness setting: no WRITE_SETTINGS permission, no value of the user's to
+            // save and put back, and the override dies with the window - so the screen comes
+            // back up on its own when the run ends, and equally if this service is killed or
+            // switched off mid-run. Starts at normal brightness and drops after UNDIM_MS, so
+            // the shade is readable when it appears.
+            lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
             windowManager.addView(box, lp);
             overlay = box;
+            overlayParams = lp;
+            handler.postDelayed(redim, UNDIM_MS);
 
             // Fade + slight scale-up so the shade eases in rather than snapping on.
             box.setAlpha(0f);
@@ -1315,14 +1341,39 @@ public class AutoUpdateService extends AccessibilityService {
     }
 
     private void hideOverlay() {
+        handler.removeCallbacks(redim);
         if (overlay != null && windowManager != null) {
+            // Hand the screen back before the window goes, so the brightness is already up
+            // when the report lands in front of the user. Removing the view would restore it
+            // anyway - this only avoids the flash of a dark report.
+            setOverlayBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
             try {
                 windowManager.removeView(overlay);
             } catch (Exception ignored) {
             }
         }
         overlay = null;
+        overlayParams = null;
         overlayStatus = null;
+    }
+
+    /** Full brightness now, back down to DIM_BRIGHTNESS once the user has stopped touching. */
+    private void undimBriefly() {
+        setOverlayBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
+        handler.removeCallbacks(redim);
+        handler.postDelayed(redim, UNDIM_MS);
+    }
+
+    private void setOverlayBrightness(float brightness) {
+        if (overlay == null || overlayParams == null || windowManager == null) return;
+        if (overlayParams.screenBrightness == brightness) return;
+        overlayParams.screenBrightness = brightness;
+        try {
+            windowManager.updateViewLayout(overlay, overlayParams);
+        } catch (Exception e) {
+            // Same rule as the overlay itself - cosmetic, never worth breaking a run over.
+            Log.w(TAG, "brightness update failed: " + e.getMessage());
+        }
     }
 
     private void setOverlayStatus(String text) {
