@@ -25,7 +25,7 @@ import java.util.regex.Pattern;
  */
 public class PlayStoreVersionFetcher {
 
-    private static final String TAG = "DeepWakeScrape";
+    private static final String TAG = "UpdateHelperScrape";
 
     public static final String NET_ERROR = "net-error";
     public static final String NO_MATCH = "no-match";
