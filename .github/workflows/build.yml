@@ -43,8 +43,8 @@ jobs:
             echo "::error::DEEPWAKE_KEYSTORE_B64 secret not set - refusing to publish a throwaway-signed APK. Run signing/set-secrets.js (see signing/SIGNING-INFO.txt)."
             exit 1
           fi
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/deepwake.keystore"
-          echo "DEEPWAKE_KEYSTORE_FILE=$RUNNER_TEMP/deepwake.keystore" >> "$GITHUB_ENV"
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/updatehelper.keystore"
+          echo "DEEPWAKE_KEYSTORE_FILE=$RUNNER_TEMP/updatehelper.keystore" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         env:
