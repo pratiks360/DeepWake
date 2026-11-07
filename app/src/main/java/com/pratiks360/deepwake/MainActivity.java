@@ -214,7 +214,7 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
     private void confirmExclude(SleepingApp app) {
         new MaterialAlertDialogBuilder(this)
                 .setTitle("Exclude " + app.appName + "?")
-                .setMessage("DeepWake will stop tracking it and skip it on every scan from "
+                .setMessage("Update Helper will stop tracking it and skip it on every scan from "
                         + "now on. You can undo this from \"Excluded apps\" in the menu.")
                 .setPositiveButton("Exclude", (d, w) -> {
                     AppRepository.excludeApp(this, app.packageName, app.appName);
@@ -266,10 +266,10 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
      */
     private void showAccessibilityHelpDialog() {
         new MaterialAlertDialogBuilder(this)
-                .setTitle("Enable the DeepWake service")
-                .setMessage("Automatic batch updates need DeepWake's accessibility service.\n\n"
+                .setTitle("Enable the Update Helper service")
+                .setMessage("Automatic batch updates need Update Helper's accessibility service.\n\n"
                         + "1. Open Accessibility settings\n"
-                        + "2. Find DeepWake and turn it on\n\n"
+                        + "2. Find Update Helper and turn it on\n\n"
                         + "If the toggle is blocked with a \"Restricted setting\" message "
                         + "(normal for apps installed outside an app store on Android 13+):\n\n"
                         + "1. Tap App info below\n"

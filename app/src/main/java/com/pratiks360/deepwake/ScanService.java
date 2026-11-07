@@ -110,7 +110,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
 
     private void updateNotification(String text) {
         Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("DeepWake")
+                .setContentTitle("Update Helper")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_stat_deepwake)
                 .setOngoing(true)
