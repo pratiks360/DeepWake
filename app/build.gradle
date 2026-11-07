@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.pratiks360.deepwake'
+    namespace 'com.updatehelper.app'
     compileSdk 37
 
     defaultConfig {
-        applicationId "com.pratiks360.deepwake"
+        applicationId "com.updatehelper.app"
         minSdk 26
         targetSdk 33
         versionCode 12

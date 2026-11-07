@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- White silhouette sun for the status-bar notification. Android renders status-bar
+<!-- White silhouette for the status-bar notification. Android renders status-bar
      small icons using only the alpha channel, so this MUST be a white-on-transparent
      shape - a full-color launcher icon would show up as a solid white blob. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -7,7 +7,6 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- core -->
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M12,12 m-4,0 a4,4 0 1,1 8,0 a4,4 0 1,1 -8,0" />

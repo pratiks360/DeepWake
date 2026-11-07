@@ -76,21 +76,21 @@ jobs:
         run: |
           mkdir -p release-assets
           cp app/build/outputs/apk/debug/app-debug.apk \
-            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk"
+            "release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-debug.apk"
           cp app/build/outputs/apk/release/app-release.apk \
-            "release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk"
+            "release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-release.apk"
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk
+          path: release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-debug.apk
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release
-          path: release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk
+          path: release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-release.apk
 
       - name: Delete previous releases and tags
         if: github.event_name == 'push'
@@ -119,8 +119,8 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
           files: |
-            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-debug.apk
-            release-assets/DeepWake-${{ steps.ver.outputs.tag }}-release.apk
+            release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-debug.apk
+            release-assets/UpdateHelper-${{ steps.ver.outputs.tag }}-release.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

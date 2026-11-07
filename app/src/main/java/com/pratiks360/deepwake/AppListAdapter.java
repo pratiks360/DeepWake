@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.view.LayoutInflater;
 import android.view.View;

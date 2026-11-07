@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.accessibilityservice.AccessibilityService;
 import android.app.ActivityManager;
@@ -32,8 +32,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Fully automated batch updating, SD-Maid style: while a batch run is active this service
+/**     * Automated batch updating: while a batch run is active this service
  * draws a full-screen tint overlay that swallows all touches (so the user can't disturb
  * the flow - only the overlay's own Cancel button works), then drives the whole loop
  * itself. The selected apps are worked through in sequential batches of BATCH_SIZE: wake
@@ -45,7 +44,7 @@ import java.util.Set;
  * apps woken later in the batch. The batch is then monitored until each app's installed
  * version actually moves, switching between the woken apps and Play Store as needed.
  *
- * Only when the current batch completes does the next batch of apps get woken; waking 50 apps
+ * When the current batch completes, the next batch of apps gets woken; waking 50 apps
  * at once just thrashes the device and re-hibernation undoes most of them before Play Store
  * gets there anyway. A batch is never abandoned while Play Store is visibly installing or
  * downloading (a big app can hold the batch for minutes without any version moving); it moves
@@ -71,12 +70,12 @@ import java.util.Set;
  * long the run takes or which app is currently visible. The user must enable the service
  * once under Settings > Accessibility; MainActivity redirects there if it's off.
  *
- * The accessibility config (res/xml/auto_update_service.xml) restricts events to
- * com.android.vending only, so this service never sees content from any other app.
+ * Accessibility config (res/xml/auto_update_service.xml) restricts events to
+ * com.android.vending only, so it never reads content from any other app.
  */
 public class AutoUpdateService extends AccessibilityService {
 
-    private static final String TAG = "DeepWakeAuto";
+    private static final String TAG = "UpdateHelperService";
 
     private static final int BATCH_SIZE = 4;          // apps woken/updated at a time
     private static final long STAGGER_MS = 700;       // between app launches
@@ -100,7 +99,7 @@ public class AutoUpdateService extends AccessibilityService {
     // the app is reported as failed rather than chased for the rest of the batch.
     private static final int VERIFY_AFTER_ATTEMPTS = 2;
     private static final int MAX_WAKE_ATTEMPTS = 5;
-    // How long to give the app's own Play Store page to load before reading what it offers.
+    // How long to wait for the app's own Play Store page to load before reading what it offers.
     private static final long DETAILS_SETTLE_MS = 2500;
     private static final int DETAILS_MAX_POLLS = 6;
     // ...but never judge an app while the batch is still visibly progressing: Play Store
@@ -151,7 +150,7 @@ public class AutoUpdateService extends AccessibilityService {
     private static final String[] BUSY_MARKERS = {"installing", "downloading", "verifying"};
 
     // Extra on the MainActivity relaunch intent: the id of the report just written to the DB.
-    public static final String EXTRA_REPORT_ID = "com.pratiks360.deepwake.REPORT_ID";
+    public static final String EXTRA_REPORT_ID = "com.updatehelper.app.REPORT_ID";
 
     // Accessibility services are singletons managed by the system; this is the standard
     // way for the rest of the app to reach the live instance (null = not enabled).
@@ -872,7 +871,7 @@ public class AutoUpdateService extends AccessibilityService {
         long reportId = AppRepository.saveReport(this, reportItems, totalSelected, updatedCount);
         Intent report = new Intent(this, MainActivity.class);
         report.putExtra(EXTRA_REPORT_ID, reportId);
-        bringDeepWakeToFront(report);
+        bringToFront(report);
     }
 
     private void addPending(SleepingApp app, String detail) {
@@ -897,7 +896,7 @@ public class AutoUpdateService extends AccessibilityService {
             return;
         }
         stopFlowInternal();
-        if (returnToApp) bringDeepWakeToFront(new Intent(this, MainActivity.class));
+        if (returnToApp) bringToFront(new Intent(this, MainActivity.class));
     }
 
     private void stopFlowInternal() {
@@ -1021,7 +1020,7 @@ public class AutoUpdateService extends AccessibilityService {
         }
     }
 
-    private void bringDeepWakeToFront(Intent i) {
+    private void bringToFront(Intent i) {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                 | Intent.FLAG_ACTIVITY_CLEAR_TOP
                 | Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -1383,7 +1382,7 @@ public class AutoUpdateService extends AccessibilityService {
             overlayStatus.setTextSize(17);
             overlayStatus.setLineSpacing(dp(3), 1f);
             overlayStatus.setGravity(Gravity.CENTER);
-            overlayStatus.setText("DeepWake is updating your apps...\nPlease don't touch the screen.");
+            overlayStatus.setText("Update Helper is working...\nPlease don't touch the screen.");
             card.addView(overlayStatus);
 
             TextView hint = new TextView(this);
@@ -1486,7 +1485,7 @@ public class AutoUpdateService extends AccessibilityService {
 
     private void setOverlayStatus(String text) {
         if (overlayStatus != null) {
-            overlayStatus.setText("DeepWake is updating your apps...\n\n" + text);
+            overlayStatus.setText("Update Helper is working...\n\n" + text);
         }
     }
 

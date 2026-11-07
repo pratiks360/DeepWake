@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.Manifest;
 import android.content.ComponentName;
@@ -209,7 +209,7 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
     /**
      * Long-press on a row. Excluding is deliberately a confirmed action rather than a swipe:
      * it's sticky, and it takes the app out of scanning entirely, so an accidental one would
-     * quietly stop DeepWake from ever looking at that app again.
+     * quietly stop this app from ever looking at that app again.
      */
     private void confirmExclude(SleepingApp app) {
         new MaterialAlertDialogBuilder(this)
@@ -266,8 +266,8 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
      */
     private void showAccessibilityHelpDialog() {
         new MaterialAlertDialogBuilder(this)
-                .setTitle("Enable the Update Helper service")
-                .setMessage("Automatic batch updates need Update Helper's accessibility service.\n\n"
+                .setTitle("Enable Update Helper")
+                .setMessage("A batch update needs Update Helper\'s accessibility service.\n\n"
                         + "1. Open Accessibility settings\n"
                         + "2. Find Update Helper and turn it on\n\n"
                         + "If the toggle is blocked with a \"Restricted setting\" message "

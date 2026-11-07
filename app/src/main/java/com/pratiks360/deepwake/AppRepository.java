@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.content.ContentValues;
 import android.content.Context;
@@ -42,11 +42,11 @@ public class AppRepository {
     public static List<SleepingApp> loadApps(Context context) {
         migrateLegacyJson(context);
         List<SleepingApp> list = new ArrayList<>();
-        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
-        try (Cursor c = db.query(DeepWakeDb.T_APPS,
-                new String[]{DeepWakeDb.C_PACKAGE, DeepWakeDb.C_APP_NAME,
-                        DeepWakeDb.C_CURRENT_VERSION, DeepWakeDb.C_LATEST_VERSION},
-                null, null, null, null, DeepWakeDb.C_APP_NAME + " COLLATE NOCASE ASC")) {
+        SQLiteDatabase db = UpdateHelperDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(UpdateHelperDb.T_APPS,
+                new String[]{UpdateHelperDb.C_PACKAGE, UpdateHelperDb.C_APP_NAME,
+                        UpdateHelperDb.C_CURRENT_VERSION, UpdateHelperDb.C_LATEST_VERSION},
+                null, null, null, null, UpdateHelperDb.C_APP_NAME + " COLLATE NOCASE ASC")) {
             while (c.moveToNext()) {
                 list.add(new SleepingApp(c.getString(0), c.getString(1),
                         c.getString(2), c.getString(3)));
@@ -58,19 +58,19 @@ public class AppRepository {
     /** Insert-or-replace one app. The scan uses this per finished lookup. */
     public static void upsertApp(Context context, SleepingApp app) {
         migrateLegacyJson(context);
-        DeepWakeDb.get(context).getWritableDatabase()
-                .insertWithOnConflict(DeepWakeDb.T_APPS, null, toValues(app),
+        UpdateHelperDb.get(context).getWritableDatabase()
+                .insertWithOnConflict(UpdateHelperDb.T_APPS, null, toValues(app),
                         SQLiteDatabase.CONFLICT_REPLACE);
     }
 
     /** Insert-or-replace a whole set in one transaction. */
     public static void upsertApps(Context context, List<SleepingApp> apps) {
         migrateLegacyJson(context);
-        SQLiteDatabase db = DeepWakeDb.get(context).getWritableDatabase();
+        SQLiteDatabase db = UpdateHelperDb.get(context).getWritableDatabase();
         db.beginTransaction();
         try {
             for (SleepingApp app : apps) {
-                db.insertWithOnConflict(DeepWakeDb.T_APPS, null, toValues(app),
+                db.insertWithOnConflict(UpdateHelperDb.T_APPS, null, toValues(app),
                         SQLiteDatabase.CONFLICT_REPLACE);
             }
             db.setTransactionSuccessful();
@@ -82,17 +82,17 @@ public class AppRepository {
     /** Stop tracking an app - it updated, so there is nothing left to do for it. */
     public static void removeApp(Context context, String packageName) {
         migrateLegacyJson(context);
-        DeepWakeDb.get(context).getWritableDatabase().delete(DeepWakeDb.T_APPS,
-                DeepWakeDb.C_PACKAGE + " = ?", new String[]{packageName});
+        UpdateHelperDb.get(context).getWritableDatabase().delete(UpdateHelperDb.T_APPS,
+                UpdateHelperDb.C_PACKAGE + " = ?", new String[]{packageName});
     }
 
     private static ContentValues toValues(SleepingApp app) {
         ContentValues v = new ContentValues();
-        v.put(DeepWakeDb.C_PACKAGE, app.packageName);
-        v.put(DeepWakeDb.C_APP_NAME, app.appName == null ? app.packageName : app.appName);
-        v.put(DeepWakeDb.C_CURRENT_VERSION, app.currentVersion == null ? "" : app.currentVersion);
-        v.put(DeepWakeDb.C_LATEST_VERSION, app.latestVersion == null ? "" : app.latestVersion);
-        v.put(DeepWakeDb.C_UPDATED_AT, System.currentTimeMillis());
+        v.put(UpdateHelperDb.C_PACKAGE, app.packageName);
+        v.put(UpdateHelperDb.C_APP_NAME, app.appName == null ? app.packageName : app.appName);
+        v.put(UpdateHelperDb.C_CURRENT_VERSION, app.currentVersion == null ? "" : app.currentVersion);
+        v.put(UpdateHelperDb.C_LATEST_VERSION, app.latestVersion == null ? "" : app.latestVersion);
+        v.put(UpdateHelperDb.C_UPDATED_AT, System.currentTimeMillis());
         return v;
     }
 
@@ -104,17 +104,17 @@ public class AppRepository {
      */
     public static void excludeApp(Context context, String packageName, String appName) {
         migrateLegacyJson(context);
-        SQLiteDatabase db = DeepWakeDb.get(context).getWritableDatabase();
+        SQLiteDatabase db = UpdateHelperDb.get(context).getWritableDatabase();
         db.beginTransaction();
         try {
             ContentValues v = new ContentValues();
-            v.put(DeepWakeDb.C_PACKAGE, packageName);
-            v.put(DeepWakeDb.C_APP_NAME, appName == null || appName.isEmpty()
+            v.put(UpdateHelperDb.C_PACKAGE, packageName);
+            v.put(UpdateHelperDb.C_APP_NAME, appName == null || appName.isEmpty()
                     ? packageName : appName);
-            v.put(DeepWakeDb.C_EXCLUDED_AT, System.currentTimeMillis());
-            db.insertWithOnConflict(DeepWakeDb.T_EXCLUDED, null, v,
+            v.put(UpdateHelperDb.C_EXCLUDED_AT, System.currentTimeMillis());
+            db.insertWithOnConflict(UpdateHelperDb.T_EXCLUDED, null, v,
                     SQLiteDatabase.CONFLICT_REPLACE);
-            db.delete(DeepWakeDb.T_APPS, DeepWakeDb.C_PACKAGE + " = ?",
+            db.delete(UpdateHelperDb.T_APPS, UpdateHelperDb.C_PACKAGE + " = ?",
                     new String[]{packageName});
             db.setTransactionSuccessful();
         } finally {
@@ -124,15 +124,15 @@ public class AppRepository {
 
     /** Undo an exclusion. The app reappears after the next scan, not immediately. */
     public static void includeApp(Context context, String packageName) {
-        DeepWakeDb.get(context).getWritableDatabase().delete(DeepWakeDb.T_EXCLUDED,
-                DeepWakeDb.C_PACKAGE + " = ?", new String[]{packageName});
+        UpdateHelperDb.get(context).getWritableDatabase().delete(UpdateHelperDb.T_EXCLUDED,
+                UpdateHelperDb.C_PACKAGE + " = ?", new String[]{packageName});
     }
 
     /** Just the package names - what a scan checks each installed app against. */
     public static Set<String> excludedPackages(Context context) {
         Set<String> out = new HashSet<>();
-        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
-        try (Cursor c = db.query(DeepWakeDb.T_EXCLUDED, new String[]{DeepWakeDb.C_PACKAGE},
+        SQLiteDatabase db = UpdateHelperDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(UpdateHelperDb.T_EXCLUDED, new String[]{UpdateHelperDb.C_PACKAGE},
                 null, null, null, null, null)) {
             while (c.moveToNext()) out.add(c.getString(0));
         }
@@ -142,10 +142,10 @@ public class AppRepository {
     /** The excluded apps with their names, for the "Excluded apps" screen. */
     public static List<ExcludedApp> loadExcluded(Context context) {
         List<ExcludedApp> out = new ArrayList<>();
-        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
-        try (Cursor c = db.query(DeepWakeDb.T_EXCLUDED,
-                new String[]{DeepWakeDb.C_PACKAGE, DeepWakeDb.C_APP_NAME},
-                null, null, null, null, DeepWakeDb.C_APP_NAME + " COLLATE NOCASE ASC")) {
+        SQLiteDatabase db = UpdateHelperDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(UpdateHelperDb.T_EXCLUDED,
+                new String[]{UpdateHelperDb.C_PACKAGE, UpdateHelperDb.C_APP_NAME},
+                null, null, null, null, UpdateHelperDb.C_APP_NAME + " COLLATE NOCASE ASC")) {
             while (c.moveToNext()) out.add(new ExcludedApp(c.getString(0), c.getString(1)));
         }
         return out;
@@ -159,33 +159,33 @@ public class AppRepository {
      */
     public static long saveReport(Context context, List<BatchReport.Item> items,
                                   int total, int updatedCount) {
-        SQLiteDatabase db = DeepWakeDb.get(context).getWritableDatabase();
+        SQLiteDatabase db = UpdateHelperDb.get(context).getWritableDatabase();
         long id;
         db.beginTransaction();
         try {
             ContentValues report = new ContentValues();
-            report.put(DeepWakeDb.C_FINISHED_AT, System.currentTimeMillis());
-            report.put(DeepWakeDb.C_TOTAL, total);
-            report.put(DeepWakeDb.C_UPDATED_COUNT, updatedCount);
-            id = db.insert(DeepWakeDb.T_REPORTS, null, report);
+            report.put(UpdateHelperDb.C_FINISHED_AT, System.currentTimeMillis());
+            report.put(UpdateHelperDb.C_TOTAL, total);
+            report.put(UpdateHelperDb.C_UPDATED_COUNT, updatedCount);
+            id = db.insert(UpdateHelperDb.T_REPORTS, null, report);
 
             for (BatchReport.Item item : items) {
                 ContentValues v = new ContentValues();
-                v.put(DeepWakeDb.C_REPORT_ID, id);
-                v.put(DeepWakeDb.C_APP_NAME, item.appName);
-                v.put(DeepWakeDb.C_PACKAGE, item.packageName);
-                v.put(DeepWakeDb.C_STATUS, item.status);
-                v.put(DeepWakeDb.C_DETAIL, item.detail);
-                db.insert(DeepWakeDb.T_REPORT_ITEMS, null, v);
+                v.put(UpdateHelperDb.C_REPORT_ID, id);
+                v.put(UpdateHelperDb.C_APP_NAME, item.appName);
+                v.put(UpdateHelperDb.C_PACKAGE, item.packageName);
+                v.put(UpdateHelperDb.C_STATUS, item.status);
+                v.put(UpdateHelperDb.C_DETAIL, item.detail);
+                db.insert(UpdateHelperDb.T_REPORT_ITEMS, null, v);
             }
 
             // Items first, or the surviving-ids subquery no longer covers the rows we drop.
-            String keep = "SELECT " + DeepWakeDb.C_ID + " FROM " + DeepWakeDb.T_REPORTS
-                    + " ORDER BY " + DeepWakeDb.C_FINISHED_AT + " DESC LIMIT " + MAX_REPORTS;
-            db.execSQL("DELETE FROM " + DeepWakeDb.T_REPORT_ITEMS
-                    + " WHERE " + DeepWakeDb.C_REPORT_ID + " NOT IN (" + keep + ")");
-            db.execSQL("DELETE FROM " + DeepWakeDb.T_REPORTS
-                    + " WHERE " + DeepWakeDb.C_ID + " NOT IN (" + keep + ")");
+            String keep = "SELECT " + UpdateHelperDb.C_ID + " FROM " + UpdateHelperDb.T_REPORTS
+                    + " ORDER BY " + UpdateHelperDb.C_FINISHED_AT + " DESC LIMIT " + MAX_REPORTS;
+            db.execSQL("DELETE FROM " + UpdateHelperDb.T_REPORT_ITEMS
+                    + " WHERE " + UpdateHelperDb.C_REPORT_ID + " NOT IN (" + keep + ")");
+            db.execSQL("DELETE FROM " + UpdateHelperDb.T_REPORTS
+                    + " WHERE " + UpdateHelperDb.C_ID + " NOT IN (" + keep + ")");
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
@@ -196,22 +196,22 @@ public class AppRepository {
     /** The stored runs, newest first, with their per-app lines attached. */
     public static List<BatchReport> loadRecentReports(Context context) {
         List<BatchReport> reports = new ArrayList<>();
-        SQLiteDatabase db = DeepWakeDb.get(context).getReadableDatabase();
-        try (Cursor c = db.query(DeepWakeDb.T_REPORTS,
-                new String[]{DeepWakeDb.C_ID, DeepWakeDb.C_FINISHED_AT,
-                        DeepWakeDb.C_TOTAL, DeepWakeDb.C_UPDATED_COUNT},
-                null, null, null, null, DeepWakeDb.C_FINISHED_AT + " DESC",
+        SQLiteDatabase db = UpdateHelperDb.get(context).getReadableDatabase();
+        try (Cursor c = db.query(UpdateHelperDb.T_REPORTS,
+                new String[]{UpdateHelperDb.C_ID, UpdateHelperDb.C_FINISHED_AT,
+                        UpdateHelperDb.C_TOTAL, UpdateHelperDb.C_UPDATED_COUNT},
+                null, null, null, null, UpdateHelperDb.C_FINISHED_AT + " DESC",
                 String.valueOf(MAX_REPORTS))) {
             while (c.moveToNext()) {
                 reports.add(new BatchReport(c.getLong(0), c.getLong(1), c.getInt(2), c.getInt(3)));
             }
         }
         for (BatchReport report : reports) {
-            try (Cursor c = db.query(DeepWakeDb.T_REPORT_ITEMS,
-                    new String[]{DeepWakeDb.C_APP_NAME, DeepWakeDb.C_PACKAGE,
-                            DeepWakeDb.C_STATUS, DeepWakeDb.C_DETAIL},
-                    DeepWakeDb.C_REPORT_ID + " = ?", new String[]{String.valueOf(report.id)},
-                    null, null, DeepWakeDb.C_ID + " ASC")) {
+            try (Cursor c = db.query(UpdateHelperDb.T_REPORT_ITEMS,
+                    new String[]{UpdateHelperDb.C_APP_NAME, UpdateHelperDb.C_PACKAGE,
+                            UpdateHelperDb.C_STATUS, UpdateHelperDb.C_DETAIL},
+                    UpdateHelperDb.C_REPORT_ID + " = ?", new String[]{String.valueOf(report.id)},
+                    null, null, UpdateHelperDb.C_ID + " ASC")) {
                 while (c.moveToNext()) {
                     report.items.add(new BatchReport.Item(
                             c.getString(0), c.getString(1), c.getString(2), c.getString(3)));
@@ -250,11 +250,11 @@ public class AppRepository {
         } catch (Exception e) {
             return; // unreadable/corrupt - leave the file alone and start clean
         }
-        SQLiteDatabase db = DeepWakeDb.get(context).getWritableDatabase();
+        SQLiteDatabase db = UpdateHelperDb.get(context).getWritableDatabase();
         db.beginTransaction();
         try {
             for (SleepingApp app : imported) {
-                db.insertWithOnConflict(DeepWakeDb.T_APPS, null, toValues(app),
+                db.insertWithOnConflict(UpdateHelperDb.T_APPS, null, toValues(app),
                         SQLiteDatabase.CONFLICT_REPLACE);
             }
             db.setTransactionSuccessful();

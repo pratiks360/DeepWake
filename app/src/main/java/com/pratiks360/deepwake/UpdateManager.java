@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.content.Context;
 import android.content.Intent;
