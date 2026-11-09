@@ -1,6 +1,8 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.Manifest;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -117,17 +119,23 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
                 return;
             }
             AutoUpdateService svc = AutoUpdateService.getInstance();
-            if (svc == null) {
-                // Batch mode is fully automated (auto-clicking Play Store's buttons, the
-                // touch-blocking shade) and that requires the accessibility service.
+            if (svc != null) {
+                if (svc.isRunning()) {
+                    Toast.makeText(this, "A batch update is already running", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                svc.startBatchUpdate(selected);
+                return;
+            }
+            // Batch mode is fully automated (auto-clicking Play Store's buttons, the
+            // touch-blocking shade) and that requires the accessibility service. When the
+            // one-time adb grant is in place the service is switched on for the run and off
+            // again afterwards; without it the user has to enable it by hand, as before.
+            if (AccessibilityGate.isGranted(this)) {
+                startRunWithGate(selected);
+            } else {
                 showAccessibilityHelpDialog();
-                return;
             }
-            if (svc.isRunning()) {
-                Toast.makeText(this, "A batch update is already running", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            svc.startBatchUpdate(selected);
         });
 
         maybeShowBatchReport(getIntent());
@@ -148,6 +156,10 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
         }
         if (id == R.id.menu_excluded) {
             showExcludedApps();
+            return true;
+        }
+        if (id == R.id.menu_auto_off) {
+            showAutoOffDialog();
             return true;
         }
         return super.onOptionsItemSelected(item);
@@ -209,7 +221,7 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
     /**
      * Long-press on a row. Excluding is deliberately a confirmed action rather than a swipe:
      * it's sticky, and it takes the app out of scanning entirely, so an accidental one would
-     * quietly stop DeepWake from ever looking at that app again.
+     * quietly stop this app from ever looking at that app again.
      */
     private void confirmExclude(SleepingApp app) {
         new MaterialAlertDialogBuilder(this)
@@ -266,8 +278,8 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
      */
     private void showAccessibilityHelpDialog() {
         new MaterialAlertDialogBuilder(this)
-                .setTitle("Enable the Update Helper service")
-                .setMessage("Automatic batch updates need Update Helper's accessibility service.\n\n"
+                .setTitle("Enable Update Helper")
+                .setMessage("A batch update needs Update Helper\'s accessibility service.\n\n"
                         + "1. Open Accessibility settings\n"
                         + "2. Find Update Helper and turn it on\n\n"
                         + "If the toggle is blocked with a \"Restricted setting\" message "
@@ -283,6 +295,76 @@ public class MainActivity extends AppCompatActivity implements ScanService.Liste
                                 Uri.parse("package:" + getPackageName()))))
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    /**
+     * The service is switched off between runs (see AccessibilityGate), so starting a run
+     * means switching it on first and waiting for the system to bind it - there is nothing
+     * to call startBatchUpdate on until that happens.
+     */
+    private void startRunWithGate(List<SleepingApp> selected) {
+        if (!AccessibilityGate.setServiceEnabled(this, true)) {
+            // Grant revoked since the last run (reinstall, permission dropped).
+            showAccessibilityHelpDialog();
+            return;
+        }
+        btnUpdateAll.setEnabled(false);
+        Toast.makeText(this, "Turning on the accessibility service for this run…",
+                Toast.LENGTH_SHORT).show();
+        awaitAccessibilityService(selected, 0);
+    }
+
+    /** Polls for the bound service; the system binds it asynchronously after the write. */
+    private void awaitAccessibilityService(List<SleepingApp> selected, int attempt) {
+        AutoUpdateService svc = AutoUpdateService.getInstance();
+        if (svc != null) {
+            if (!svc.isRunning()) svc.startBatchUpdate(selected);
+            return;
+        }
+        if (attempt >= 40) { // ~8s - if it hasn't bound by now it isn't going to
+            AccessibilityGate.setServiceEnabled(this, false);
+            updateSelectionCount();
+            Toast.makeText(this, "The accessibility service didn't start - enable it by hand once",
+                    Toast.LENGTH_LONG).show();
+            showAccessibilityHelpDialog();
+            return;
+        }
+        btnUpdateAll.postDelayed(() -> awaitAccessibilityService(selected, attempt + 1), 200);
+    }
+
+    /**
+     * Explains the one-time grant that keeps the accessibility service off except during a
+     * run. Only adb (or Shizuku) can grant WRITE_SECURE_SETTINGS - there is no permission
+     * dialog for it - so the command is shown and copyable. Nothing here is a pass/fail
+     * gate: without the grant the app still works the old way, service left enabled.
+     */
+    private void showAutoOffDialog() {
+        String command = "adb shell pm grant " + getPackageName()
+                + " android.permission.WRITE_SECURE_SETTINGS";
+        String status = AccessibilityGate.isGranted(this)
+                ? "Granted. The accessibility service is switched on when you start an update "
+                        + "and off again when the run ends, so it is not active while you use "
+                        + "other apps."
+                : "Not granted yet. Until it is, the service has to stay enabled in Settings "
+                        + "after you turn it on, and other apps can see it while it is on.";
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("Keep the service off between runs")
+                .setMessage(status
+                        + "\n\nRun this once from a computer with adb over USB "
+                        + "(or from Shizuku, if you have it installed):\n\n" + command
+                        + "\n\nAfterwards, batch updates turn the accessibility service on for "
+                        + "the run and back off when it finishes or is cancelled. Everything "
+                        + "else keeps working exactly as before.")
+                .setPositiveButton("Copy command", (d, w) -> copyToClipboard(command))
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void copyToClipboard(String text) {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null) return;
+        clipboard.setPrimaryClip(ClipData.newPlainText("adb command", text));
+        Toast.makeText(this, "Command copied", Toast.LENGTH_SHORT).show();
     }
 
     @Override

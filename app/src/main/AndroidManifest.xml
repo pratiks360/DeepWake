@@ -10,6 +10,12 @@
          so reopening it forces a cold reload of the updates list. Normal-level permission,
          granted at install. -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <!-- Never granted at runtime: this one comes from a computer over adb, or from Shizuku.
+         With it, the app switches its accessibility service on only for a batch run and off
+         again afterwards, so the service is not enabled while other apps are in use. Without
+         it the app still works, with the service left on as before. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:icon="@mipmap/ic_launcher"

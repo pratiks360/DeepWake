@@ -15,5 +15,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "DeepWake"
+rootProject.name = "UpdateHelper"
 include ':app'

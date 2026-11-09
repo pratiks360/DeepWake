@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.content.Context;
 import android.database.sqlite.SQLiteDatabase;
@@ -20,9 +20,9 @@ import android.database.sqlite.SQLiteOpenHelper;
  * relations worth modelling, and this keeps the build free of annotation processing.
  * Access goes through AppRepository, never directly.
  */
-public class DeepWakeDb extends SQLiteOpenHelper {
+public class UpdateHelperDb extends SQLiteOpenHelper {
 
-    private static final String NAME = "deepwake.db";
+    private static final String NAME = "updatehelper.db";
     private static final int VERSION = 2;   // 2: added the excluded table
 
     static final String T_APPS = "apps";
@@ -46,17 +46,17 @@ public class DeepWakeDb extends SQLiteOpenHelper {
     static final String T_EXCLUDED = "excluded";
     static final String C_EXCLUDED_AT = "excluded_at";
 
-    private static DeepWakeDb instance;
+    private static UpdateHelperDb instance;
 
     /** One helper per process - SQLiteOpenHelper is thread-safe, multiple helpers are not. */
-    static synchronized DeepWakeDb get(Context context) {
+    static synchronized UpdateHelperDb get(Context context) {
         if (instance == null) {
-            instance = new DeepWakeDb(context.getApplicationContext());
+            instance = new UpdateHelperDb(context.getApplicationContext());
         }
         return instance;
     }
 
-    private DeepWakeDb(Context context) {
+    private UpdateHelperDb(Context context) {
         super(context, NAME, null, VERSION);
     }
 

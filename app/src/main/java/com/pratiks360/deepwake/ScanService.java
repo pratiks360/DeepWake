@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class ScanService extends Service implements UpdateManager.Listener {
 
-    private static final String CHANNEL_ID = "deepwake_activity";
+    private static final String CHANNEL_ID = "updatehelper";
     private static final int NOTIFICATION_ID = 1;
     // Play Store fetches are network-bound (up to a 12s timeout each) and independent, so
     // they run on a small pool in parallel. Kept modest to avoid hammering Play Store.
@@ -103,7 +103,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationManager nm = getSystemService(NotificationManager.class);
             NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "DeepWake activity", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "Update Helper", NotificationManager.IMPORTANCE_LOW);
             nm.createNotificationChannel(channel);
         }
     }
@@ -112,7 +112,7 @@ public class ScanService extends Service implements UpdateManager.Listener {
         Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Update Helper")
                 .setContentText(text)
-                .setSmallIcon(R.drawable.ic_stat_deepwake)
+                .setSmallIcon(R.drawable.ic_stat_notification)
                 .setOngoing(true)
                 .build();
         startForeground(NOTIFICATION_ID, n);

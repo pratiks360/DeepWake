@@ -1,4 +1,4 @@
-package com.pratiks360.deepwake;
+package com.updatehelper.app;
 
 /** A package the user has excluded from scanning and updating. */
 public class ExcludedApp {
