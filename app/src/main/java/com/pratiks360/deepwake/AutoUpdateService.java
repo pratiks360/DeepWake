@@ -872,6 +872,12 @@ public class AutoUpdateService extends AccessibilityService {
         Intent report = new Intent(this, MainActivity.class);
         report.putExtra(EXTRA_REPORT_ID, reportId);
         bringToFront(report);
+
+        // The run is over, so switch the service back off if it was only on for this run
+        // (see AccessibilityGate). While it is enabled every app on the device can see it,
+        // which is what puts an "accessibility service" warning in front of banking apps.
+        // No-op when the one-time adb grant isn't in place - then it stays on, as before.
+        AccessibilityGate.setServiceEnabled(this, false);
     }
 
     private void addPending(SleepingApp app, String detail) {

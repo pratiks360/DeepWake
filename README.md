@@ -69,6 +69,16 @@ Android hibernates apps you don't open often to save battery — Samsung, Xiaomi
 3. Tap **Update** on a single app, or **Update All** for a batch run.
 4. For batch runs, enable Update Helper under **Settings → Accessibility** once when prompted — this is what lets it drive Play Store's UI and survive background restrictions for a run that can take close to an hour.
 
+### Keeping the accessibility service off between runs
+
+An enabled accessibility service is visible to every app on the device, which is why banking apps show an "accessibility service detected" warning while it is on. It only needs to be on for the minutes a batch actually runs, so you can have the app switch it on for a run and off again when the run ends. That needs one permission no dialog can grant, so hand it over once from a computer with adb (or from Shizuku):
+
+```bash
+adb shell pm grant com.updatehelper.app android.permission.WRITE_SECURE_SETTINGS
+```
+
+After that, the service is off while you use other apps and only comes on for an update run. The menu item **Keep service off between runs** shows whether the grant is in place and the exact command for your install. Without the grant the app works exactly as before — the service stays enabled once you turn it on.
+
 ### Build from source
 
 ```bash
@@ -116,6 +126,7 @@ cd UpdateHelper
 | `FOREGROUND_SERVICE` | Keeps a scan or update session running while the app is backgrounded |
 | `POST_NOTIFICATIONS` | Shows scan/update progress in the notification shade |
 | `KILL_BACKGROUND_PROCESSES` | Lets a batch run force-restart a stuck Play Store process (stale "all up to date" cache) |
+| `WRITE_SECURE_SETTINGS` (opt-in, adb only) | Lets the app enable its accessibility service for a run and disable it afterwards. Can only be granted from a computer over adb or from Shizuku; the app works without it |
 | Accessibility Service (opt-in) | Only used to drive Play Store's own UI during a batch run — restricted to `com.android.vending` events only, never reads content from any other app |
 
 ---
@@ -143,6 +154,9 @@ A: Update Helper checked the app's own Play Store page directly and Play Store g
 
 **Q: The accessibility-driven batch update doesn't start.**
 A: It needs the accessibility permission enabled once under **Settings → Accessibility → Update Helper**. The app prompts for this the first time you try a batch update.
+
+**Q: A banking app says an accessibility service is running.**
+A: That warning appears whenever *any* third-party accessibility service is enabled — it is not about this app's name, and no rename or label change affects it. The service is only needed during a batch run: grant `WRITE_SECURE_SETTINGS` once (see above) and Update Helper will switch it on for a run and off when it ends, so it is off while you bank.
 
 **Q: Build fails locally with "SDK location not found."**
 A: You need the Android SDK installed and `ANDROID_HOME` set, or a `local.properties` pointing at it. CI builds don't need this — pushing to a branch is the fastest way to get a compiled APK if you don't have the SDK locally.

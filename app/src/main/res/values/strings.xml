@@ -12,6 +12,7 @@
 
     <string name="menu_reports">Recent runs</string>
     <string name="menu_excluded">Excluded apps</string>
+    <string name="menu_auto_off">Keep service off between runs</string>
 
     <string name="empty_title">Nothing to update</string>
     <string name="empty_subtitle">Every sleeping app is on its latest version.\nScan again to re-check.</string>
